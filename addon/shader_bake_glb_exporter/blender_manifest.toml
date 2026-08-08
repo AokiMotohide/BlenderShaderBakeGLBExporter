@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+id = "shader_bake_glb_exporter"
+version = "1.0.0"
+name = "Shader Bake GLB Exporter"
+tagline = "Bake connected shaders and export selected meshes to GLB"
+maintainer = "AokiMotohide"
+type = "add-on"
+website = "https://github.com/AokiMotohide/BlenderShaderBakeGLBExporter"
+tags = ["Import-Export", "Material"]
+blender_version_min = "5.1.1"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Write the selected GLB output and temporary bake images"
