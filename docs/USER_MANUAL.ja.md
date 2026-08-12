@@ -2,16 +2,18 @@
 
 ## 1. 概要
 
-Shader Bake GLB Exporterは、選択したMeshのPrincipled BSDF材質をPBRテクスチャへベイクし、標準GLB 2.0へ書き出すBlender Extensionです。手続き型テクスチャやノードグループを、一般的なGLBビューアで扱える画像テクスチャへ変換できます。
+Shader Bake GLB Exporterは、選択したMeshの接続済みシェーダーをPBRテクスチャへベイクし、標準GLB 2.0へ書き出すBlender Extensionです。
 
-元のObject、Mesh、Material、Node、Image、UV、Modifierは直接変更しません。処理用コピーと一時データは、成功、失敗、キャンセルのいずれでも削除されます。
+Principled BSDFのglTF対応入力はPBRおよびKHR材質へ変換します。直接変換できないShaderも外観をCore PBRへ近似し、個別Bakeに失敗したチャンネルは安全値へ置換して、可能な限りGLB生成を継続します。
+
+元Object、Mesh、Material、Node、Image、UV、Modifierは変更しません。一時データは成功、失敗、キャンセルの全経路で削除されます。
 
 ## 2. 動作環境
 
 - Windows
 - Blender 5.1.1
 - Cyclesが利用できる環境
-- 外部Pythonパッケージは不要
+- 外部Pythonパッケージ不要
 
 Blender 5.1.1以外での動作は保証していません。
 
@@ -25,24 +27,27 @@ Blender 5.1.1以外での動作は保証していません。
 6. ダウンロードしたZIPを指定します。
 7. 「Shader Bake GLB Exporter」を有効にします。
 
-インストール後、3D Viewportで`N`キーを押してSidebarを表示すると、`GLB Bake Export`タブが追加されます。
+3D Viewportで`N`キーを押してSidebarを表示すると、「GLB Bake Export」タブが追加されます。
 
-## 4. 基本的な書き出し手順
+## 4. 書き出し手順
 
 1. BlenderをObject Modeにします。
-2. GLBへ含めるMeshオブジェクトを1個以上選択します。選択していないObjectは出力されません。
-3. 3D Viewportで`N`キーを押し、`GLB Bake Export`タブを開きます。
-4. `出力GLBパス`に、拡張子`.glb`を含む保存先を指定します。
-5. `Texture Resolution`を選択します。
-6. パネルに表示される選択Mesh数と検出Material数を確認します。
-7. `選択オブジェクトをGLB書き出し`を押します。
-8. 完了後、パネルに表示されるGLBパスを確認します。
+2. GLBへ含めるMeshを1件以上選択します。
+3. Sidebarの「GLB Bake Export」を開きます。
+4. `Texture Resolution`を選択します。
+5. 選択Mesh数と検出Material数を確認します。
+6. 「GLBを書き出し…」を押します。
+7. 標準保存ダイアログで保存先を確認し、「GLBを書き出し」を実行します。
 
-書き出し前に、既存の同名GLBは置換されません。新しいGLBを一時ファイルへ書き出し、構造検証に成功した場合だけ保存先を置換します。
+保存名に拡張子を入力しなくても`.glb`が自動で付きます。初回のファイル名は次の順で決まります。
+
+1. 保存済みBlendのファイル名
+2. 未保存時のActive Mesh名
+3. `export.glb`
+
+2回目以降は前回の保存先を再利用します。同名GLBがある場合はBlender標準の上書き確認が表示されます。
 
 ## 5. Texture Resolution
-
-解像度は、すべての選択Objectと使用中Material Slotに共通で適用されます。
 
 | 設定 | 用途 | 注意点 |
 | --- | --- | --- |
@@ -50,81 +55,107 @@ Blender 5.1.1以外での動作は保証していません。
 | 1024 | 標準用途 | 既定値 |
 | 2048 | 細部を保持する出力 | ベイク時間とメモリ使用量が増える |
 
-生成される画像は8bit PNGです。UV islandとベイクの余白は解像度の1/64です。
+解像度は、すべての選択Objectと使用中Material Slotへ共通で適用されます。生成画像は8bit PNGです。
 
-## 6. 対応する材質
+## 6. 完全変換する材質
 
-Active Material OutputのSurfaceへ、単一のPrincipled BSDFが直接接続された材質に対応します。次の入力をGLBへ反映します。
+Active Material OutputのSurfaceへPrincipled BSDFが直接接続されている場合、次の入力をベイクします。
 
 - Base ColorとAlpha
-- MetallicとRoughness
+- Occlusion、Metallic、Roughness
 - Normal
 - Emission ColorとEmission Strength
-- Transmission Weight
-- 定数IOR
+- Transmission WeightとIOR
+- Specular IOR LevelとSpecular Tint
+- Coat Weight、Coat Roughness、Coat Normal
+- Sheen Weight、Sheen Tint、Sheen Roughness
+- AnisotropicとAnisotropic Rotation
+- glTF Material OutputのThicknessとPrincipled Volume
 
-Image Texture、Noise Texture、Voronoi Texture、ColorRamp、Mapping、Math、Vector Math、Mix Color、Object座標、Generated座標、Node Groupなど、Cyclesで評価可能な接続ノードをベイクできます。同じMaterialを複数Objectが共有していても、ObjectとMaterial Slotごとに結果を作成します。
+必要に応じて`KHR_materials_transmission`、`KHR_materials_ior`、`KHR_materials_specular`、`KHR_materials_clearcoat`、`KHR_materials_sheen`、`KHR_materials_anisotropy`、`KHR_materials_volume`、`KHR_materials_emissive_strength`を出力します。Emissionだけの材質は`KHR_materials_unlit`として出力します。
 
-## 7. 未対応の主な機能
+Principled入力へ接続された、Cyclesで評価可能な手続き型テクスチャやNode Groupもベイクできます。
 
-- Mix Shader、Add Shader、Principled BSDF以外のSurface Shader
-- Toon BSDF
-- Subsurface、Coat、Sheen、Anisotropic、Thin Film
-- Shader Displacement、Volume
+## 7. 外観近似とフォールバック
+
+Principled BSDFへ完全変換できない材質は、Diffuse、Glossy、Transmission、Roughness、Normal、Emission、AlphaのBake結果からCore PBRへ近似します。
+
+主な対象は次のとおりです。
+
+- Mix Shader、Add Shader、Principled以外のBSDF
+- Toon、Glass、Subsurface、Thin Film
 - Procedural IOR
-- Layer Weight、Camera Data、Light Path、Fresnelなどの視線依存評価
-- OSL Script
-- Alpha Blend、Alpha Hashed
-- Animation、Skin、Morph、Camera、Light
-- Draco、gltfpack、Custom Properties
+- Shader Displacement
+- Camera Data、Light Path、Layer Weight、Fresnelなどの視線依存評価
+- glTFで直接保持できないVolume表現
 
-Alpha Clipには対応します。しきい値を取得できない場合は0.5を使用します。
+近似材質は、元Shaderとの物理的・視線依存な完全一致を保証しません。省略または近似した内容は「警告一覧」に表示されます。
 
-## 8. 実行中の操作とキャンセル
+個別チャンネルのBakeが失敗した場合は、次の値へ置換してJobを継続します。
 
-パネルには進捗、処理中のObject、Material、処理段階が表示されます。Cycles Bake中はBlenderを一時的に操作できません。
+| チャンネル | 既定値 |
+| --- | --- |
+| Base Color | viewport色、取得不能時は0.8灰色 |
+| Metallic | 0 |
+| Roughness | 0.5 |
+| Normal | フラット |
+| Emission | 0 |
+| Transmission | 0 |
+| IOR | 1.5 |
 
-`キャンセル`を押すか`Esc`キーを押すと、現在実行中のBakeが完了した後に停止します。処理途中のGLBは最終保存先へ反映されません。
+Material未割当、Node未使用、Surface未接続も既定PBR材質へ置換します。FaceなしMeshは警告付きで除外されます。書き出せるMeshが1件も残らない場合は失敗します。
 
-## 9. エラー対処
+## 8. Alpha
 
-### 「選択Meshが0件です」
+| Blender材質 | GLB |
+| --- | --- |
+| 不透明 | `alphaMode: OPAQUE` |
+| Alpha Clip | `alphaMode: MASK`と`alphaCutoff` |
+| 連続Alpha、Alpha Blend | `alphaMode: BLEND` |
+| Alpha Hashed相当 | `alphaMode: BLEND` |
 
-Object ModeでMeshオブジェクトを1個以上選択してください。Curve、Camera、Lightだけを選択しても出力対象になりません。
+glTF 2.0にはAlpha Hashedと同一のモードがないため、連続AlphaのBLENDへ変換します。
 
-### 「出力先が未指定です」または「出力拡張子は.glbが必要です」
+## 9. 実行中の表示とキャンセル
 
-`出力GLBパス`へ、ファイル名と`.glb`拡張子を含む保存先を指定してください。
+Sidebarには進捗、処理中Object、Material、チャンネルが表示されます。Cycles Bake中はBlenderを一時的に操作できません。
 
-### 「FaceがないMeshはベイクできません」
+「キャンセル」または`Esc`を押すと、現在実行中のBakeが完了した後に停止します。未検証の一時GLBは最終保存先へ反映されません。
 
-頂点やEdgeだけでなく、Faceを持つMeshを使用してください。
+成功時に近似や置換が発生した場合は「警告一覧」が表示されます。GLB生成を中止した問題だけが「エラー一覧」に表示されます。
 
-### MaterialまたはShaderに関するエラー
+## 10. Jobが失敗する条件
 
-対象MaterialのActive Material Outputを確認し、Surfaceへ単一のPrincipled BSDFを直接接続してください。未対応機能を外すか、事前に対応可能なノード構成へ変換してください。
+- 選択Meshが0件、または書き出せるFaceを持つMeshが0件
+- 出力先が未指定
+- Texture Resolutionが契約外
+- ファイル作成または原子的置換に失敗
+- Blender標準glTF exporterがGLBを生成しない
+- 生成GLBのヘッダー、Mesh、Material、Texture、Alpha、KHR拡張などの構造検証に失敗
 
-### ベイクに時間がかかる
+材質表現の非対応だけでは原則として失敗せず、警告付きフォールバックになります。
 
-まず512で確認し、最終出力時に1024または2048へ上げてください。Object数、Material Slot数、画像解像度が増えるほど処理時間とメモリ使用量が増えます。
+## 11. 出力対象外
 
-## 10. アンインストール
+- Animation
+- Skin
+- Morph
+- Camera
+- Light
+- Draco
+- gltfpack
+- Custom Properties
+
+## 12. 安全性
+
+元データは直接変更しません。Modifier適用済みMesh、Material、Node、Image、UV、Node GroupなどはJob専用コピーとして作成されます。
+
+生成GLBは最終保存先と同じフォルダの一時ファイルへ出力します。GLB 2.0構造、必要Attribute、Material、PNG、Alpha、KHR拡張を検証し、成功した場合だけ最終パスへ原子的に置換します。失敗時は既存の正常なGLBを維持します。
+
+## 13. アンインストール
 
 1. Blenderの`Edit > Preferences > Extensions`を開きます。
 2. 「Shader Bake GLB Exporter」を検索します。
 3. Extensionのメニューから`Uninstall`を実行します。
 
 アンインストールしても、すでに書き出したGLBは削除されません。
-
-## 11. 出力仕様
-
-- 標準GLB 2.0
-- 選択Meshだけを出力
-- Base Color + Alpha: RGBA PNG、sRGB
-- ORM: RGB PNG、linear、R=1、G=Roughness、B=Metallic
-- Normal: tangent-space RGB PNG、linear
-- Emissive: RGB PNG、sRGB
-- Transmission: grayscaleをRGBへ複製したPNG、linear
-- IOR: 定数
-
-生成したGLBは、glTF 2.0 Metallic-Roughness材質と、使用されるKHR材質拡張に対応したビューアまたはレンダラーで読み込んでください。

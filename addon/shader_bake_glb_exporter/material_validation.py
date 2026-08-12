@@ -1,4 +1,4 @@
-"""Principled材質を標準Metallic-Roughnessへ変換できるか検証する。"""
+"""Materialを完全変換または外観近似へ分類する。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ EPSILON = 1.0e-6
 
 @dataclass(frozen=True)
 class AlphaContract:
-    """Alphaの公開契約。source_socketはClip比較前の値を指す。"""
+    """AlphaのGLB契約。source_socketはBakeで評価する値を指す。"""
 
     mode: str
     cutoff: float
@@ -23,18 +23,24 @@ class AlphaContract:
 
 @dataclass(frozen=True)
 class MaterialAnalysis:
-    """Bakeが利用する検証済みMaterial情報。"""
+    """Materialの変換方式と、完全変換で使用する入力。"""
 
     material: bpy.types.Material
-    output_node: bpy.types.Node
-    principled_node: bpy.types.Node
+    output_node: bpy.types.Node | None
+    principled_node: bpy.types.Node | None
     alpha: AlphaContract
     ior: float
+    strategy: str
+    fallback_reasons: tuple[str, ...]
+    active_extensions: frozenset[str]
+    occlusion_socket: bpy.types.NodeSocket | None = None
+    thickness_socket: bpy.types.NodeSocket | None = None
+    volume_node: bpy.types.Node | None = None
 
 
 @dataclass(frozen=True)
 class MaterialValidationError(Exception):
-    """Object名、Material名、拒否理由をUIへ渡す構造化エラー。"""
+    """Object名、Material名、理由をUIへ渡す診断。"""
 
     object_name: str
     material_name: str
@@ -51,15 +57,6 @@ def _socket(node: bpy.types.Node, name: str) -> bpy.types.NodeSocket:
     return socket
 
 
-def _is_finite_value(value: object) -> bool:
-    if isinstance(value, (int, float)):
-        return math.isfinite(float(value))
-    try:
-        return all(math.isfinite(float(component)) for component in value)  # type: ignore[arg-type]
-    except TypeError:
-        return True
-
-
 def _constant(socket: bpy.types.NodeSocket) -> float:
     return float(socket.default_value)
 
@@ -68,8 +65,29 @@ def _linked_source(socket: bpy.types.NodeSocket) -> bpy.types.NodeSocket | None:
     return socket.links[0].from_socket if socket.is_linked and socket.links else None
 
 
+def _finite_or(value: float, fallback: float) -> float:
+    return value if math.isfinite(value) else fallback
+
+
+def _as_tuple(value: object) -> tuple[float, ...]:
+    if isinstance(value, (int, float)):
+        return (float(value),)
+    try:
+        return tuple(float(component) for component in value)  # type: ignore[arg-type]
+    except TypeError:
+        return ()
+
+
+def _socket_active(socket: bpy.types.NodeSocket, neutral: float | tuple[float, ...]) -> bool:
+    if socket.is_linked:
+        return True
+    actual = _as_tuple(socket.default_value)
+    expected = (float(neutral),) if isinstance(neutral, (int, float)) else tuple(float(v) for v in neutral)
+    return len(actual) < len(expected) or any(abs(actual[i] - expected[i]) > EPSILON for i in range(len(expected)))
+
+
 def _all_nested_nodes(node_tree: bpy.types.NodeTree) -> Iterable[bpy.types.Node]:
-    """Node Group内も含める。Group内の未使用ノードも安全側で検査する。"""
+    """Node Group内も含め、循環参照を避けてNodeを列挙する。"""
 
     visited: set[int] = set()
 
@@ -88,7 +106,7 @@ def _all_nested_nodes(node_tree: bpy.types.NodeTree) -> Iterable[bpy.types.Node]
 
 
 def _reachable_nodes(principled: bpy.types.Node) -> list[tuple[bpy.types.Node, str]]:
-    """Principled入力から到達できる上流Nodeと利用Output名を返す。"""
+    """Principled入力から到達できるNodeと利用Output名を返す。"""
 
     found: list[tuple[bpy.types.Node, str]] = []
     visited: set[tuple[int, str, tuple[int, ...]]] = set()
@@ -105,200 +123,204 @@ def _reachable_nodes(principled: bpy.types.Node) -> list[tuple[bpy.types.Node, s
         for link in input_socket.links:
             node = link.from_node
             output_socket = link.from_socket
-            key = (
-                node.as_pointer(),
-                output_socket.identifier or output_socket.name,
-                tuple(group.as_pointer() for group in group_stack),
-            )
+            key = (node.as_pointer(), output_socket.identifier or output_socket.name, tuple(n.as_pointer() for n in group_stack))
             if key in visited:
                 continue
             visited.add(key)
             found.append((node, output_socket.name))
-
             nested = getattr(node, "node_tree", None)
             if node.bl_idname == "ShaderNodeGroup" and nested is not None:
-                group_outputs = [item for item in nested.nodes if item.bl_idname == "NodeGroupOutput"]
-                active_output = next((item for item in group_outputs if item.is_active_output), None)
-                group_output = active_output or (group_outputs[0] if group_outputs else None)
+                outputs = [item for item in nested.nodes if item.bl_idname == "NodeGroupOutput"]
+                group_output = next((item for item in outputs if item.is_active_output), None) or (outputs[0] if outputs else None)
                 if group_output is not None:
                     index = list(node.outputs).index(output_socket)
-                    internal_input = matching_socket(group_output.inputs, output_socket, index)
-                    if internal_input is not None:
-                        walk_input(internal_input, group_stack + (node,))
+                    internal = matching_socket(group_output.inputs, output_socket, index)
+                    if internal is not None:
+                        walk_input(internal, group_stack + (node,))
                 continue
-
             if node.bl_idname == "NodeGroupInput" and group_stack:
-                outer_group = group_stack[-1]
+                outer = group_stack[-1]
                 index = list(node.outputs).index(output_socket)
-                external_input = matching_socket(outer_group.inputs, output_socket, index)
-                if external_input is not None:
-                    walk_input(external_input, group_stack[:-1])
+                external = matching_socket(outer.inputs, output_socket, index)
+                if external is not None:
+                    walk_input(external, group_stack[:-1])
                 continue
+            for upstream in node.inputs:
+                walk_input(upstream, group_stack)
 
-            for upstream_input in node.inputs:
-                walk_input(upstream_input, group_stack)
-
-    for input_socket in principled.inputs:
-        walk_input(input_socket, ())
+    for socket in principled.inputs:
+        walk_input(socket, ())
     return found
 
 
-def _alpha_contract(material: bpy.types.Material, principled: bpy.types.Node) -> AlphaContract:
+def _gltf_socket(material: bpy.types.Material, name: str) -> bpy.types.NodeSocket | None:
+    if material.node_tree is None:
+        return None
+    for node in material.node_tree.nodes:
+        nested = getattr(node, "node_tree", None)
+        if node.bl_idname == "ShaderNodeGroup" and nested is not None and nested.name.lower().startswith("gltf material output"):
+            return node.inputs.get(name)
+    return None
+
+
+def _alpha_contract(principled: bpy.types.Node) -> AlphaContract:
     alpha = _socket(principled, "Alpha")
     if not alpha.is_linked:
-        value = _constant(alpha)
-        if not math.isfinite(value):
-            raise ValueError("Alpha定数が有限値ではありません")
+        value = _finite_or(_constant(alpha), 1.0)
         if abs(value - 1.0) <= EPSILON:
             return AlphaContract("OPAQUE", 0.5, None)
-        raise ValueError("Alpha BlendまたはAlpha Hashed相当の定数Alphaは未対応です")
+        return AlphaContract("BLEND", 0.5, alpha)
 
     source = alpha.links[0].from_node
-    fallback = float(getattr(material, "alpha_threshold", 0.5))
-    if not math.isfinite(fallback):
-        fallback = 0.5
-
     if source.bl_idname == "ShaderNodeMath" and source.operation == "ROUND":
         return AlphaContract("CLIP", 0.5, _linked_source(source.inputs[0]) or source.inputs[0])
-
     if source.bl_idname == "ShaderNodeMath" and source.operation == "GREATER_THAN":
         threshold = source.inputs[1]
         if threshold.is_linked:
-            raise ValueError("Alpha Clipのしきい値がProceduralです")
-        cutoff = _constant(threshold)
-        if not math.isfinite(cutoff):
-            cutoff = fallback
+            return AlphaContract("CLIP", 0.5, source.outputs[0])
+        cutoff = min(1.0, max(0.0, _finite_or(_constant(threshold), 0.5)))
         return AlphaContract("CLIP", cutoff, _linked_source(source.inputs[0]) or source.inputs[0])
-
     if source.bl_idname == "ShaderNodeMath" and source.operation == "LESS_THAN":
         left, right = source.inputs[0], source.inputs[1]
         if not left.is_linked and right.is_linked:
-            cutoff = _constant(left)
-            return AlphaContract("CLIP", cutoff if math.isfinite(cutoff) else fallback, _linked_source(right) or right)
-
+            cutoff = min(1.0, max(0.0, _finite_or(_constant(left), 0.5)))
+            return AlphaContract("CLIP", cutoff, _linked_source(right) or right)
     if source.bl_idname == "ShaderNodeMath" and source.operation == "SUBTRACT":
         left, right = source.inputs[0], source.inputs[1]
         compare = right.links[0].from_node if right.is_linked else None
         if abs(_constant(left) - 1.0) <= EPSILON and compare and compare.bl_idname == "ShaderNodeMath":
-            if compare.operation == "LESS_THAN" and compare.inputs[1].is_linked is False:
-                cutoff = _constant(compare.inputs[1])
-                return AlphaContract("CLIP", cutoff if math.isfinite(cutoff) else fallback, _linked_source(compare.inputs[0]) or compare.inputs[0])
+            if compare.operation == "LESS_THAN" and not compare.inputs[1].is_linked:
+                cutoff = min(1.0, max(0.0, _finite_or(_constant(compare.inputs[1]), 0.5)))
+                return AlphaContract("CLIP", cutoff, _linked_source(compare.inputs[0]) or compare.inputs[0])
+    return AlphaContract("BLEND", 0.5, alpha.links[0].from_socket)
 
-    raise ValueError("Alpha BlendまたはAlpha Hashed相当の連続Alphaは未対応です")
+
+def _fallback_analysis(material: bpy.types.Material, reasons: Iterable[str], output: bpy.types.Node | None = None) -> MaterialAnalysis:
+    color = tuple(float(v) for v in material.diffuse_color)
+    alpha = AlphaContract("OPAQUE" if len(color) < 4 or color[3] >= 1.0 - EPSILON else "BLEND", 0.5, None)
+    return MaterialAnalysis(material, output, None, alpha, 1.5, "FALLBACK", tuple(dict.fromkeys(reasons)), frozenset())
 
 
-def _validate_principled_contract(principled: bpy.types.Node) -> None:
-    zero_only = (
-        "Subsurface Weight",
-        "Coat Weight",
-        "Sheen Weight",
-        "Anisotropic",
-        "Diffuse Roughness",
-        "Thin Film Thickness",
+def analyze_material(material: bpy.types.Material, object_name: str = "") -> MaterialAnalysis:
+    """拒否ではなく、完全変換可能か外観近似が必要かを判定する。"""
+
+    if material is None:
+        raise MaterialValidationError(object_name or "<Object>", "<なし>", "Materialがありません")
+    if not material.use_nodes or material.node_tree is None:
+        return _fallback_analysis(material, ("Node未使用Materialをviewport色で近似します",))
+
+    outputs = [node for node in material.node_tree.nodes if node.bl_idname == "ShaderNodeOutputMaterial" and node.is_active_output]
+    if len(outputs) != 1:
+        return _fallback_analysis(material, ("Active Material Outputを特定できないため近似します",))
+    output = outputs[0]
+    surface = output.inputs.get("Surface")
+    if surface is None or len(surface.links) != 1:
+        return _fallback_analysis(material, ("Surface接続がないためviewport色で近似します",), output)
+    principled = surface.links[0].from_node
+    if principled.bl_idname == "ShaderNodeEmission":
+        return MaterialAnalysis(
+            material,
+            output,
+            None,
+            AlphaContract("OPAQUE", 0.5, None),
+            1.5,
+            "UNLIT",
+            (),
+            frozenset({"unlit"}),
+        )
+    if principled.bl_idname != "ShaderNodeBsdfPrincipled":
+        return _fallback_analysis(material, (f"{principled.bl_label or principled.name}をPBRへ近似します",), output)
+
+    reasons: list[str] = []
+    unsupported = (
+        ("Weight", 1.0),
+        ("Diffuse Roughness", 0.0),
+        ("Subsurface Weight", 0.0),
+        ("Thin Film Thickness", 0.0),
     )
-    for name in zero_only:
-        socket = _socket(principled, name)
-        if socket.is_linked or abs(_constant(socket)) > EPSILON:
-            raise ValueError(f"{name}が有効な材質は未対応です")
+    for name, neutral in unsupported:
+        socket = principled.inputs.get(name)
+        if socket is not None and _socket_active(socket, neutral):
+            reasons.append(f"{name}をCore PBRへ近似します")
+    coat = principled.inputs.get("Coat Weight")
+    if coat is not None and _socket_active(coat, 0.0):
+        coat_ior = principled.inputs.get("Coat IOR")
+        coat_tint = principled.inputs.get("Coat Tint")
+        if coat_ior is not None and _socket_active(coat_ior, 1.5):
+            reasons.append("Coat IORを近似します")
+        if coat_tint is not None and _socket_active(coat_tint, (1.0, 1.0, 1.0)):
+            reasons.append("Coat Tintを近似します")
+    if output.inputs.get("Displacement") and output.inputs["Displacement"].is_linked:
+        reasons.append("Shader DisplacementはGLB材質へ保持できないため省略します")
 
-    specular_level = _socket(principled, "Specular IOR Level")
-    if specular_level.is_linked or abs(_constant(specular_level) - 0.5) > EPSILON:
-        raise ValueError("非標準のSpecular IOR Levelは未対応です")
-
-    specular_tint = _socket(principled, "Specular Tint")
-    tint = tuple(float(value) for value in specular_tint.default_value)
-    if specular_tint.is_linked or any(abs(value - 1.0) > EPSILON for value in tint[:3]):
-        raise ValueError("Specular Tintは未対応です")
-
-    ior = _socket(principled, "IOR")
-    if ior.is_linked:
-        raise ValueError("Procedural IORは未対応です")
-    if not math.isfinite(_constant(ior)) or _constant(ior) < 1.0:
-        raise ValueError("IOR定数は1以上の有限値が必要です")
-
-    for name in (
-        "Base Color",
-        "Metallic",
-        "Roughness",
-        "IOR",
-        "Alpha",
-        "Emission Color",
-        "Emission Strength",
-        "Transmission Weight",
-    ):
-        socket = _socket(principled, name)
-        if not socket.is_linked and not _is_finite_value(socket.default_value):
-            raise ValueError(f"{name}定数が有限値ではありません")
-
-
-def _validate_upstream_nodes(material: bpy.types.Material, principled: bpy.types.Node) -> None:
-    forbidden_ids = {
-        "ShaderNodeMixShader": "Mix Shader",
-        "ShaderNodeAddShader": "Add Shader",
-        "ShaderNodeBsdfToon": "Toon BSDF",
-        "ShaderNodeLayerWeight": "Layer Weight",
+    risky = {
         "ShaderNodeCameraData": "Camera Data",
         "ShaderNodeLightPath": "Light Path",
+        "ShaderNodeLayerWeight": "Layer Weight",
         "ShaderNodeFresnel": "Fresnel",
         "ShaderNodeScript": "OSL Script",
     }
     for node, output_name in _reachable_nodes(principled):
-        label = forbidden_ids.get(node.bl_idname)
+        label = risky.get(node.bl_idname)
         if label:
-            raise ValueError(f"{label}は未対応です")
-        if node.bl_idname == "ShaderNodeTexCoord" and output_name in {"Camera", "Window", "Reflection", "*"}:
-            raise ValueError("視線依存のTexture Coordinateは未対応です")
-        if node.bl_idname == "ShaderNodeVectorTransform":
-            if getattr(node, "convert_from", "") == "CAMERA" or getattr(node, "convert_to", "") == "CAMERA":
-                raise ValueError("Camera空間のVector Transformは未対応です")
+            reasons.append(f"{label}の視線依存結果を固定テクスチャへ近似します")
+        if node.bl_idname == "ShaderNodeTexCoord" and output_name in {"Camera", "Window", "Reflection"}:
+            reasons.append("視線依存Texture Coordinateを固定テクスチャへ近似します")
+    if any(node.bl_idname == "ShaderNodeScript" for node in _all_nested_nodes(material.node_tree)):
+        reasons.append("OSL Scriptは評価失敗時に既定値へ置換します")
 
-    # Group内は共有NodeTreeなので変更しない。危険Nodeが存在するGroupは保守的に拒否する。
-    for node in _all_nested_nodes(material.node_tree):
-        if node.bl_idname == "ShaderNodeScript":
-            raise ValueError("OSL Scriptは未対応です")
+    ior_socket = _socket(principled, "IOR")
+    if ior_socket.is_linked:
+        reasons.append("Procedural IORはテクスチャ化できないため近似します")
+        ior = 1.5
+    else:
+        ior = _finite_or(_constant(ior_socket), 1.5)
+        if ior < 1.0:
+            ior = 1.5
+            reasons.append("IORを1.5へ補正します")
 
+    extensions: set[str] = set()
+    if _socket_active(_socket(principled, "Transmission Weight"), 0.0):
+        extensions.add("transmission")
+    if _socket_active(_socket(principled, "Specular IOR Level"), 0.5) or _socket_active(_socket(principled, "Specular Tint"), (1.0, 1.0, 1.0)):
+        extensions.add("specular")
+    if coat is not None and _socket_active(coat, 0.0):
+        extensions.add("clearcoat")
+    if _socket_active(_socket(principled, "Sheen Weight"), 0.0):
+        extensions.add("sheen")
+    if _socket_active(_socket(principled, "Anisotropic"), 0.0):
+        extensions.add("anisotropy")
+    occlusion = _gltf_socket(material, "Occlusion")
+    if occlusion is not None and _socket_active(occlusion, 1.0):
+        extensions.add("occlusion")
+    thickness = _gltf_socket(material, "Thickness")
+    volume_input = output.inputs.get("Volume")
+    volume_node = volume_input.links[0].from_node if volume_input and volume_input.is_linked else None
+    if thickness is not None and _socket_active(thickness, 0.0) and volume_node is not None and volume_node.bl_idname == "ShaderNodeVolumePrincipled":
+        extensions.add("volume")
+    elif volume_input and volume_input.is_linked:
+        reasons.append("VolumeをCore PBR外観へ近似し、体積効果は省略します")
 
-def analyze_material(material: bpy.types.Material, object_name: str = "") -> MaterialAnalysis:
-    """材質を検証し、Bakeに必要な安定した入口を返す。"""
-
-    material_name = material.name if material else "<なし>"
-    try:
-        if material is None:
-            raise ValueError("Materialが割り当てられていません")
-        if not material.use_nodes or material.node_tree is None:
-            raise ValueError("Node Materialではありません")
-        if getattr(material, "surface_render_method", "DITHERED") == "BLENDED":
-            raise ValueError("Alpha Blendは未対応です")
-
-        outputs = [
-            node
-            for node in material.node_tree.nodes
-            if node.bl_idname == "ShaderNodeOutputMaterial" and node.is_active_output
-        ]
-        if len(outputs) != 1:
-            raise ValueError("Active Material Outputが1つ必要です")
-        output = outputs[0]
-        surface = output.inputs.get("Surface")
-        if surface is None or len(surface.links) != 1:
-            raise ValueError("Material OutputのSurfaceへ単一Shaderを接続してください")
-        principled = surface.links[0].from_node
-        if principled.bl_idname != "ShaderNodeBsdfPrincipled":
-            raise ValueError("SurfaceへPrincipled BSDFを直接接続してください")
-        if output.inputs.get("Volume") and output.inputs["Volume"].is_linked:
-            raise ValueError("Volume接続は未対応です")
-        if output.inputs.get("Displacement") and output.inputs["Displacement"].is_linked:
-            raise ValueError("Shader Displacementは未対応です")
-
-        _validate_principled_contract(principled)
-        _validate_upstream_nodes(material, principled)
-        alpha = _alpha_contract(material, principled)
-        return MaterialAnalysis(material, output, principled, alpha, _constant(_socket(principled, "IOR")))
-    except ValueError as exc:
-        raise MaterialValidationError(object_name or "<Object>", material_name, str(exc)) from exc
+    strategy = "FALLBACK" if reasons else "PBR"
+    return MaterialAnalysis(
+        material,
+        output,
+        principled,
+        _alpha_contract(principled),
+        ior,
+        strategy,
+        tuple(dict.fromkeys(reasons)),
+        frozenset(extensions),
+        occlusion,
+        thickness,
+        volume_node,
+    )
 
 
 def find_principled(material: bpy.types.Material) -> tuple[bpy.types.Node, bpy.types.Node]:
-    """検証済みMaterialコピーからActive OutputとPrincipledを再取得する。"""
+    """完全変換可能なMaterialからActive OutputとPrincipledを取得する。"""
 
     analysis = analyze_material(material, "<作業用>")
+    if analysis.output_node is None or analysis.principled_node is None:
+        raise MaterialValidationError("<作業用>", material.name, "Principled BSDFを取得できません")
     return analysis.output_node, analysis.principled_node

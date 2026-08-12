@@ -1,6 +1,6 @@
 # Shader Bake GLB Exporter
 
-Shader Bake GLB Exporterは、選択したMeshオブジェクトの接続済みPrincipled BSDFシェーダーをPBRテクスチャへベイクし、標準GLB 2.0として書き出すBlenderアドオンです。
+Shader Bake GLB Exporterは、選択したMeshの接続済みシェーダーをPBRテクスチャへベイクし、標準GLB 2.0として書き出すBlender Extensionです。Principled BSDFはglTF材質へ変換し、それ以外のSurface Shaderは外観をCore PBRへ近似して、可能な限り書き出しを継続します。
 
 ## 対応環境
 
@@ -13,60 +13,65 @@ Shader Bake GLB Exporterは、選択したMeshオブジェクトの接続済みP
 
 1. [GitHub Releases](https://github.com/AokiMotohide/BlenderShaderBakeGLBExporter/releases/latest)から`shader_bake_glb_exporter-1.0.0.zip`をダウンロードします。ZIPは展開しません。
 2. Blenderの`Edit > Preferences > Extensions`を開きます。
-3. 右上のメニューから`Install from Disk`を選び、ダウンロードしたZIPを指定します。
+3. 右上のメニューから`Install from Disk`を選び、ZIPを指定します。
 4. 「Shader Bake GLB Exporter」を有効にします。
 
-詳しい操作、設定、対応範囲、エラー対処は[日本語マニュアル](docs/USER_MANUAL.ja.md)を参照してください。
+詳しい操作方法は[日本語マニュアル](docs/USER_MANUAL.ja.md)を参照してください。
 
 ## 使用方法
 
-1. Object Modeで書き出すMeshオブジェクトを選択します。
+1. Object Modeで書き出すMeshを選択します。
 2. 3D ViewのSidebarから「GLB Bake Export」を開きます。
-3. 出力GLBパスとTexture Resolutionを指定します。
-4. 「選択オブジェクトをGLB書き出し」を押します。
+3. Texture Resolutionを選択し、「GLBを書き出し…」を押します。
+4. 標準保存ダイアログで保存先を確認し、「GLBを書き出し」を実行します。
 
-解像度は全Objectと全Material Slotへ共通で適用されます。512は短時間確認用、1024は既定値、2048は細部を保持する用途です。UV islandとBakeの余白は解像度の1/64です。
+保存ダイアログには`.glb`が自動で付きます。初回名は、保存済みBlendではBlend名、未保存時はActive Mesh名、どちらも利用できない場合は`export.glb`です。2回目以降は前回の保存先を再利用します。
 
 ## 出力仕様
 
 - 標準GLB 2.0
 - 選択Meshだけを出力
 - Base Color + Alpha: RGBA PNG、sRGB
-- ORM: RGB PNG、linear、R=1、G=Roughness、B=Metallic
-- Normal: tangent-space RGB PNG、linear
+- ORM: RGB PNG、Linear、R=Occlusion、G=Roughness、B=Metallic
+- Normal: tangent-space RGB PNG、Linear
 - Emissive: RGB PNG、sRGB
-- Transmission: grayscaleをRGBへ複製したPNG、linear
-- IOR: 定数
 - 画像: 8bit PNG
-- Animation、Skin、Morph、Camera、Light、Draco、gltfpack、Custom Propertiesなし
+- 対応する場合はTransmission、IOR、Specular、Clearcoat、Sheen、Anisotropy、Volume、Emissive Strength、Unlit用KHR拡張を出力
 
-## 対応するシェーダー
+## 材質の変換
 
-Active Material OutputのSurfaceへ単一Principled BSDFが直接接続された材質に対応します。Principled BSDFのBase Color、Metallic、Roughness、Normal、Emission Color、Emission Strength、Alpha、Transmission Weightへ接続された、Cyclesで評価可能なノードをベイクします。
+Active Material OutputへPrincipled BSDFが直接接続され、glTFで表現できる材質は、各入力を個別にベイクしてPBRおよびKHR材質へ変換します。Image Texture、Noise Texture、Voronoi Texture、ColorRamp、Mapping、Math、Vector Math、Mix Color、Object座標、Generated座標、Node Groupなど、Cyclesで評価できる接続を利用できます。
 
-Image Texture、Noise Texture、Voronoi Texture、ColorRamp、Mapping、Math、Vector Math、Mix Color、Object座標、Generated座標、Node Groupを利用できます。同じMaterialを複数Objectが共有する場合も、ObjectとMaterial Slotごとに別の結果を生成します。
+glTFに直接対応しないSurface Shaderや機能は、Diffuse、Glossy、Transmission、Roughness、Normal、Emission、AlphaのBake結果からCore PBR材質へ近似します。対象にはMix Shader、Add Shader、Glass、Toon、Subsurface、Thin Film、Shader Displacement、視線依存ノードなどが含まれます。
 
-## 未対応
+個別チャンネルのBakeに失敗した場合も、次の安全値へ置換して処理を継続します。
 
-- Mix Shader、Add Shader、Principled BSDF以外のSurface Shader
-- Toon BSDF
-- Subsurface、Coat、Sheen、Anisotropic、Thin Film
-- Shader Displacement、Volume
-- Procedural IOR
-- Layer Weight、Camera Data、Light Path、Fresnelなどの視線依存評価
-- OSL Script
-- Alpha Blend、Alpha Hashed
-- Metallic-Roughness契約で保持できないPrincipled設定
+- Base Color: 元Materialのviewport色、取得できない場合は0.8灰色
+- Metallic: 0
+- Roughness: 0.5
+- Normal: フラット
+- Emission: 0
+- Transmission: 0
+- IOR: 1.5
 
-Alpha Clipには対応します。しきい値を取得できない場合は0.5を使用します。
+Material未割当、Node未使用、Surface未接続も既定PBR材質へ置換します。近似または置換した内容はSidebarの「警告一覧」へ表示されます。
 
-## 実行中の挙動
+## Alpha
 
-処理は同一Blenderプロセス内のModal Operatorで進みます。Object、Material、Channelの処理単位間でUIと進捗を更新します。Cycles Bake中は一時的に操作できません。キャンセルは現在のBakeが完了した後に反映され、新しいBakeは開始されません。
+- 不透明: `alphaMode: OPAQUE`
+- Alpha Clip: `alphaMode: MASK`と`alphaCutoff`
+- 連続Alpha、Alpha Blend、Alpha Hashed相当: `alphaMode: BLEND`
 
-元Object、Mesh、Material、Node、Image、UV、Modifierは変更しません。評価済みコピーを作業用Collectionへ隔離します。Cycles用Render設定と選択状態は開始前に保存し、成功、失敗、キャンセルの全経路で復元します。一時データも全終了経路で削除します。
+glTFにはAlpha Hashedと同一のモードがないため、連続AlphaとしてBLENDへ変換します。
 
-生成したGLBは、標準glTF 2.0のMetallic-Roughness材質とKHR拡張に対応するGLBビューアまたはレンダラーで読み込めます。
+## 制約
+
+- 近似材質は元Shaderとの物理的・視線依存な完全一致を保証しません。
+- VolumeとShader DisplacementはGLBで保持できる範囲だけを出力し、それ以外は省略して警告します。
+- Animation、Skin、Morph、Camera、Light、Draco、gltfpack、Custom Propertiesは出力しません。
+- 解像度は全Objectと全Material Slotへ共通で適用します。512、1024、2048から選択します。
+
+元Object、Mesh、Material、Node、Image、UV、Modifier、Scene設定、Render設定は直接変更しません。一時データは成功、失敗、キャンセルの全経路で削除します。GLBは一時ファイルへ出力し、構造検証に成功した場合だけ最終パスへ原子的に置換します。
 
 ## テスト
 
@@ -82,4 +87,4 @@ Alpha Clipには対応します。しきい値を取得できない場合は0.5�
 powershell -ExecutionPolicy Bypass -File tools/package.ps1
 ```
 
-`dist`は再生成可能なartifactのためGit管理しません。生成スクリプトはBlender 5.1.1のExtension検証とbuildを実行します。
+`dist`は再生成可能なartifactのためGit管理しません。生成スクリプトはBlender 5.1.1のExtension検証、build、ZIP内容検証を実行します。

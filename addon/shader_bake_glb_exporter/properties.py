@@ -27,6 +27,7 @@ class SHADERBAKEGLB_PG_Settings(bpy.types.PropertyGroup):
     current_phase: StringProperty(default="", options={"HIDDEN"})
     completed_path: StringProperty(default="", options={"HIDDEN"})
     errors: CollectionProperty(type=SHADERBAKEGLB_PG_ErrorItem)
+    warnings: CollectionProperty(type=SHADERBAKEGLB_PG_ErrorItem)
 
 
 CLASSES = (SHADERBAKEGLB_PG_ErrorItem, SHADERBAKEGLB_PG_Settings)

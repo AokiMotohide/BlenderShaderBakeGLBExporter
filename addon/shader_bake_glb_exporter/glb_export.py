@@ -137,15 +137,34 @@ def validate_glb(path: Path, expected_meshes: int, expected_materials: int) -> P
 
     for material_index, material in enumerate(document.get("materials", [])):
         pbr = material.get("pbrMetallicRoughness", {})
-        if "baseColorTexture" not in pbr or "metallicRoughnessTexture" not in pbr:
+        extensions = material.get("extensions", {})
+        is_unlit = "KHR_materials_unlit" in extensions
+        if "baseColorTexture" not in pbr or (not is_unlit and "metallicRoughnessTexture" not in pbr):
             raise BakeFailure(f"Material {material_index}のBase/ORM textureが不足しています")
-        if "normalTexture" not in material or "emissiveTexture" not in material:
+        if not is_unlit and ("normalTexture" not in material or "emissiveTexture" not in material):
             raise BakeFailure(f"Material {material_index}のNormal/Emissive textureが不足しています")
-        transmission = material.get("extensions", {}).get("KHR_materials_transmission", {})
-        if "transmissionTexture" not in transmission:
-            raise BakeFailure(f"Material {material_index}のTransmission textureが不足しています")
-        if material.get("alphaMode", "OPAQUE") not in {"OPAQUE", "MASK"}:
-            raise BakeFailure(f"Material {material_index}がAlpha Blendです")
+        alpha_mode = material.get("alphaMode", "OPAQUE")
+        if alpha_mode not in {"OPAQUE", "MASK", "BLEND"}:
+            raise BakeFailure(f"Material {material_index}のalphaModeが不正です: {alpha_mode}")
+        if alpha_mode == "MASK":
+            cutoff = float(material.get("alphaCutoff", 0.5))
+            if not math.isfinite(cutoff) or not 0.0 <= cutoff <= 1.0:
+                raise BakeFailure(f"Material {material_index}のalphaCutoffが不正です")
+
+        required_extension_textures = {
+            "KHR_materials_transmission": ("transmissionTexture",),
+            "KHR_materials_specular": ("specularTexture", "specularColorTexture"),
+            "KHR_materials_clearcoat": ("clearcoatTexture", "clearcoatRoughnessTexture", "clearcoatNormalTexture"),
+            "KHR_materials_sheen": ("sheenColorTexture", "sheenRoughnessTexture"),
+            "KHR_materials_anisotropy": ("anisotropyTexture",),
+            "KHR_materials_volume": ("thicknessTexture",),
+        }
+        for extension_name, texture_names in required_extension_textures.items():
+            extension = extensions.get(extension_name)
+            if extension is None:
+                continue
+            if not any(name in extension for name in texture_names):
+                raise BakeFailure(f"Material {material_index}の{extension_name} textureが不足しています")
 
     _validate_png_images(parsed)
     return parsed

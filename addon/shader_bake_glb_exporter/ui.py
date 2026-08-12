@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import bpy
+from bpy.props import StringProperty
+from bpy_extras.io_utils import ExportHelper
 
 from .job import BakeJob, BakeJobConfig, JobStatus, detected_material_count, selected_mesh_objects
 
@@ -30,14 +32,47 @@ def _copy_job_state(context: bpy.types.Context, job: BakeJob) -> None:
     for error in job.errors:
         item = settings.errors.add()
         item.message = str(error)
+    settings.warnings.clear()
+    for warning in job.warnings:
+        item = settings.warnings.add()
+        item.message = str(warning)
 
 
-class SHADERBAKEGLB_OT_ExportSelected(bpy.types.Operator):
+def ensure_glb_extension(filepath: str) -> str:
+    """保存名に.glbがなければ、Blender標準exporterと同様に追加する。"""
+
+    if not filepath or filepath.lower().endswith(".glb"):
+        return filepath
+    return filepath + ".glb"
+
+
+def default_export_filepath(
+    blend_filepath: str,
+    active_mesh_name: str,
+    previous_path: str,
+    fallback_directory: str,
+) -> str:
+    """前回値、Blend名、Active Mesh名の順で保存候補を決める。"""
+
+    if previous_path:
+        return ensure_glb_extension(previous_path)
+    if blend_filepath:
+        source = Path(blend_filepath)
+        return str(source.with_suffix(".glb"))
+    stem = bpy.path.clean_name(active_mesh_name) if active_mesh_name else "export"
+    stem = stem or "export"
+    return str(Path(fallback_directory) / f"{stem}.glb")
+
+
+class SHADERBAKEGLB_OT_ExportSelected(bpy.types.Operator, ExportHelper):
     """選択Meshを作業コピーでベイクし、検証済みGLBへ書き出す公開Operator。"""
 
     bl_idname = "shader_bake_glb.export_selected"
-    bl_label = "選択オブジェクトをGLB書き出し"
+    bl_label = "GLBを書き出し"
     bl_options = {"REGISTER"}
+    filename_ext = ".glb"
+    filter_glob: StringProperty(default="*.glb", options={"HIDDEN"})
+    filepath: StringProperty(subtype="FILE_PATH")
 
     _timer = None
 
@@ -45,14 +80,37 @@ class SHADERBAKEGLB_OT_ExportSelected(bpy.types.Operator):
     def poll(cls, context: bpy.types.Context) -> bool:
         return context.window_manager is not None and not _settings(context).is_running
 
+    def check(self, _context: bpy.types.Context) -> bool:
+        normalized = ensure_glb_extension(self.filepath)
+        changed = normalized != self.filepath
+        self.filepath = normalized
+        return changed
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event):
+        settings = _settings(context)
+        active = context.view_layer.objects.active
+        active_name = active.name if active is not None and active.type == "MESH" else ""
+        fallback_directory = bpy.path.abspath("//")
+        self.filepath = default_export_filepath(
+            bpy.data.filepath,
+            active_name,
+            settings.output_path,
+            fallback_directory,
+        )
+        return ExportHelper.invoke(self, context, event)
+
     def execute(self, context: bpy.types.Context):
         global ACTIVE_JOB
         settings = _settings(context)
         settings.errors.clear()
+        settings.warnings.clear()
         settings.completed_path = ""
         settings.progress = 0.0
         settings.cancel_requested = False
-        output_text = bpy.path.abspath(settings.output_path) if settings.output_path else ""
+        requested = self.filepath or settings.output_path
+        output_text = bpy.path.abspath(ensure_glb_extension(requested)) if requested else ""
+        self.filepath = output_text
+        settings.output_path = output_text
         config = BakeJobConfig(Path(output_text), int(settings.resolution))
         job = BakeJob(context, config)
         ACTIVE_JOB = job
@@ -90,7 +148,10 @@ class SHADERBAKEGLB_OT_ExportSelected(bpy.types.Operator):
         if status == JobStatus.SUCCEEDED:
             settings = _settings(context)
             settings.completed_path = str(job.config.output_path.resolve())
-            self.report({"INFO"}, "GLB書き出しが完了しました")
+            if job.warnings:
+                self.report({"WARNING"}, f"GLB書き出しが完了しました（警告{len(job.warnings)}件）")
+            else:
+                self.report({"INFO"}, "GLB書き出しが完了しました")
             return {"FINISHED"}
         if status == JobStatus.CANCELLED:
             self.report({"WARNING"}, "GLB書き出しをキャンセルしました")
@@ -143,7 +204,6 @@ class SHADERBAKEGLB_PT_Panel(bpy.types.Panel):
         layout = self.layout
         settings = _settings(context)
         meshes = selected_mesh_objects(context)
-        layout.prop(settings, "output_path")
         layout.prop(settings, "resolution")
         stats = layout.column(align=True)
         stats.label(text=f"選択Mesh数: {len(meshes)}")
@@ -161,12 +221,17 @@ class SHADERBAKEGLB_PT_Panel(bpy.types.Panel):
             row.enabled = not settings.cancel_requested
             row.operator(SHADERBAKEGLB_OT_Cancel.bl_idname, icon="CANCEL")
         else:
-            layout.operator(SHADERBAKEGLB_OT_ExportSelected.bl_idname, icon="EXPORT")
+            layout.operator(SHADERBAKEGLB_OT_ExportSelected.bl_idname, text="GLBを書き出し…", icon="EXPORT")
 
         if settings.errors:
             box = layout.box()
             box.label(text="エラー一覧", icon="ERROR")
             for item in settings.errors:
+                box.label(text=item.message)
+        if settings.warnings:
+            box = layout.box()
+            box.label(text="警告一覧", icon="INFO")
+            for item in settings.warnings:
                 box.label(text=item.message)
         if settings.completed_path:
             box = layout.box()

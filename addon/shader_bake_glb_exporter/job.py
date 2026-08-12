@@ -11,11 +11,11 @@ import bpy
 
 from .bake import (
     BakeFailure,
-    CHANNELS,
     TempDataRegistry,
     WorkObject,
     bake_channel,
     combine_ready_images,
+    channels_for_analysis,
     create_job_scene,
     create_work_object,
     finalize_work_object,
@@ -24,7 +24,7 @@ from .bake import (
     used_material_indices,
 )
 from .glb_export import PendingGlb, export_to_temporary_glb, validate_and_commit
-from .material_validation import MaterialValidationError, analyze_material
+from .material_validation import MaterialValidationError
 
 
 class JobStatus(str, Enum):
@@ -89,9 +89,12 @@ def preflight(
     """一時DataBlockを作る前に全対象を検証する。"""
 
     errors: list[MaterialValidationError] = []
-    selected = list(objects) if objects is not None else selected_mesh_objects(context)
-    if not selected:
+    candidates = list(objects) if objects is not None else selected_mesh_objects(context)
+    if not candidates:
         errors.append(MaterialValidationError("<選択>", "<なし>", "選択Meshが0件です"))
+    selected = [obj for obj in candidates if obj.data.polygons]
+    if candidates and not selected:
+        errors.append(MaterialValidationError("<選択>", "<なし>", "書き出せるFaceを持つMeshがありません"))
     if not str(config.output_path):
         errors.append(MaterialValidationError("<出力>", "<なし>", "出力先が未指定です"))
     elif config.output_path.suffix.lower() != ".glb":
@@ -101,19 +104,8 @@ def preflight(
 
     material_usages = 0
     for obj in selected:
-        if not obj.data.polygons:
-            errors.append(MaterialValidationError(obj.name, "<なし>", "FaceがないMeshはベイクできません"))
-            continue
         for slot_index in used_material_indices(obj.data):
             material_usages += 1
-            if slot_index >= len(obj.material_slots) or obj.material_slots[slot_index].material is None:
-                errors.append(MaterialValidationError(obj.name, f"Slot {slot_index}", "使用中SlotにMaterialがありません"))
-                continue
-            material = obj.material_slots[slot_index].material
-            try:
-                analyze_material(material, obj.name)
-            except MaterialValidationError as exc:
-                errors.append(exc)
     return selected, errors, material_usages
 
 
@@ -128,11 +120,16 @@ class BakeJob:
     ) -> None:
         self.context = context
         self.config = config
+        candidates = list(objects) if objects is not None else selected_mesh_objects(context)
         self.objects, self.errors, self.material_usages = preflight(context, config, objects)
+        self.warnings: list[MaterialValidationError] = []
+        for obj in candidates:
+            if not obj.data.polygons:
+                self._warn(obj.name, "<なし>", "Faceがないため書き出し対象から除外しました")
         self.status = JobStatus.READY
         self.cancel_requested = False
         self.completed_units = 0
-        self.total_units = 9 * self.material_usages + len(self.objects) + 2
+        self.total_units = 0
         self.current_phase = "検証"
         self.current_object = ""
         self.current_material = ""
@@ -144,6 +141,11 @@ class BakeJob:
         self._steps: list[JobStep] = []
         self._step_index = 0
         self._snapshot: ContextSnapshot | None = None
+
+    def _warn(self, object_name: str, material_name: str, reason: str) -> None:
+        warning = MaterialValidationError(object_name, material_name, reason)
+        if warning not in self.warnings:
+            self.warnings.append(warning)
 
     @property
     def progress(self) -> float:
@@ -189,14 +191,17 @@ class BakeJob:
             self._ensure_original_object_mode()
             self.scene, self.collection = create_job_scene(self.context.scene, self.registry)
             for original in self.objects:
-                self.work_objects.append(
-                    create_work_object(self.context, original, self.scene, self.collection, self.registry)
-                )
-            actual_usages = sum(len(work.slots) for work in self.work_objects)
-            if actual_usages != self.material_usages:
-                raise BakeFailure("Modifier評価後にMaterial Slot構成が変化したため安全に進捗を確定できません")
-            self.completed_units = self.material_usages
+                try:
+                    self.work_objects.append(
+                        create_work_object(self.context, original, self.scene, self.collection, self.registry, self._warn)
+                    )
+                except Exception as exc:
+                    self._warn(original.name, "<なし>", f"Mesh準備に失敗したため除外しました: {exc}")
+            if not self.work_objects:
+                raise BakeFailure("書き出せるMeshがありません")
+            self.material_usages = sum(len(work.slots) for work in self.work_objects)
             self._build_steps()
+            self.total_units = len(self._steps)
             self.status = JobStatus.RUNNING
         except Exception as exc:
             self._fail(exc)
@@ -209,11 +214,11 @@ class BakeJob:
             )
         for work in self.work_objects:
             for slot in work.slots:
-                for channel in CHANNELS:
+                for channel in channels_for_analysis(slot.source_analysis):
                     stem = f"{work.original.name}_slot_{slot.slot_index}"
 
                     def channel_action(work=work, slot=slot, channel=channel, stem=stem):
-                        bake_channel(self.context, self.scene, work, slot, channel, self.config.resolution, self.registry)
+                        bake_channel(self.context, self.scene, work, slot, channel, self.config.resolution, self.registry, self._warn)
                         combine_ready_images(slot, self.config.resolution, self.registry, stem)
 
                     self._steps.append(JobStep(channel, work.original.name, slot.source_material.name, channel_action))

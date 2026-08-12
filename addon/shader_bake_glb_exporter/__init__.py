@@ -6,7 +6,7 @@ bl_info = {
     "version": (1, 0, 0),
     "blender": (5, 1, 1),
     "location": "3D View > Sidebar > GLB Bake Export",
-    "description": "接続済みPrincipledシェーダーをPBRテクスチャへベイクして選択MeshをGLBへ書き出します",
+    "description": "接続済みシェーダーをPBRテクスチャへベイクして選択MeshをGLBへ書き出します",
     "category": "Import-Export",
     "license": "GPL-3.0-or-later",
 }

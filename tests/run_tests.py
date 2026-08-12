@@ -23,6 +23,7 @@ sys.path.insert(0, str(REPO_ROOT / "addon"))
 import shader_bake_glb_exporter as addon  # noqa: E402
 from shader_bake_glb_exporter.glb_export import parse_glb  # noqa: E402
 from shader_bake_glb_exporter.job import BakeJob, BakeJobConfig, JobStatus, preflight  # noqa: E402
+from shader_bake_glb_exporter.ui import default_export_filepath, ensure_glb_extension  # noqa: E402
 
 
 class TestResults:
@@ -205,7 +206,7 @@ def image_pixels(image: bpy.types.Image) -> array:
 
 def has_temp_data() -> bool:
     prefixes = ("__SHADER_BAKE_GLB",)
-    collections = (bpy.data.scenes, bpy.data.collections, bpy.data.objects, bpy.data.meshes, bpy.data.materials, bpy.data.images)
+    collections = (bpy.data.scenes, bpy.data.collections, bpy.data.objects, bpy.data.meshes, bpy.data.materials, bpy.data.images, bpy.data.node_groups)
     return any(block.name.startswith(prefixes) for collection in collections for block in collection)
 
 
@@ -292,11 +293,21 @@ def run() -> TestResults:
     mix_tree.nodes.clear()
     mix_output = mix_tree.nodes.new("ShaderNodeOutputMaterial")
     mix = mix_tree.nodes.new("ShaderNodeMixShader")
+    mix.inputs[0].default_value = 0.35
+    diffuse = mix_tree.nodes.new("ShaderNodeBsdfDiffuse")
+    diffuse.inputs["Color"].default_value = (0.7, 0.2, 0.1, 1.0)
+    transparent = mix_tree.nodes.new("ShaderNodeBsdfTransparent")
+    mix_tree.links.new(diffuse.outputs[0], mix.inputs[1])
+    mix_tree.links.new(transparent.outputs[0], mix.inputs[2])
     mix_tree.links.new(mix.outputs[0], mix_output.inputs["Surface"])
     mix_obj = make_cube("MixObject", mix_material, (6.0, 0.0, 0.0))
     select_only(mix_obj)
     _, mix_errors, _ = preflight(bpy.context, BakeJobConfig(temp_root / "mix.glb", 512))
-    results.check("13. Mix Shaderを未対応として拒否する", bool(mix_errors))
+    mix_job = BakeJob(bpy.context, BakeJobConfig(temp_root / "mix.glb", 512))
+    mix_status = mix_job.run_to_completion()
+    mix_parsed = parse_glb(temp_root / "mix.glb") if (temp_root / "mix.glb").is_file() else None
+    mix_alpha = mix_parsed.document["materials"][0].get("alphaMode") if mix_parsed else None
+    results.check("13. Mix Shaderを近似して書き出す", not mix_errors and mix_status == JobStatus.SUCCEEDED and mix_alpha == "BLEND" and bool(mix_job.warnings), "; ".join(str(error) for error in mix_job.errors))
 
     displacement_material, _, displacement_output = make_principled_material("DisplacementRejected")
     displacement_value = displacement_material.node_tree.nodes.new("ShaderNodeValue")
@@ -304,7 +315,9 @@ def run() -> TestResults:
     displacement_obj = make_cube("DisplacementObject", displacement_material, (9.0, 0.0, 0.0))
     select_only(displacement_obj)
     _, displacement_errors, _ = preflight(bpy.context, BakeJobConfig(temp_root / "displacement.glb", 512))
-    results.check("14. Shader Displacementを拒否する", any("Displacement" in error.reason for error in displacement_errors))
+    displacement_job = BakeJob(bpy.context, BakeJobConfig(temp_root / "displacement.glb", 512))
+    displacement_status = displacement_job.run_to_completion()
+    results.check("14. Shader Displacementを警告して書き出す", not displacement_errors and displacement_status == JobStatus.SUCCEEDED and any("Displacement" in warning.reason for warning in displacement_job.warnings), "; ".join(str(error) for error in displacement_job.errors))
 
     grouped_material, grouped_principled, _ = make_principled_material("GroupedGenerated")
     group_tree = bpy.data.node_groups.new("GeneratedColorGroup", "ShaderNodeTree")
@@ -322,12 +335,115 @@ def run() -> TestResults:
     _, grouped_errors, _ = preflight(bpy.context, BakeJobConfig(temp_root / "grouped.glb", 512))
     results.check("Node Group内のGenerated座標を検証できる", not grouped_errors, "; ".join(str(error) for error in grouped_errors))
 
-    blend_material, _, _ = make_principled_material("BlendRejected")
+    blend_material, blend_principled, _ = make_principled_material("BlendAccepted")
     blend_material.surface_render_method = "BLENDED"
+    blend_principled.inputs["Alpha"].default_value = 0.4
     blend_obj = make_cube("BlendObject", blend_material, (18.0, 0.0, 0.0))
     select_only(blend_obj)
     _, blend_errors, _ = preflight(bpy.context, BakeJobConfig(temp_root / "blend.glb", 512))
-    results.check("Alpha Blendを拒否する", any("Alpha Blend" in error.reason for error in blend_errors))
+    blend_job = BakeJob(bpy.context, BakeJobConfig(temp_root / "blend.glb", 512))
+    blend_status = blend_job.run_to_completion()
+    blend_parsed = parse_glb(temp_root / "blend.glb") if (temp_root / "blend.glb").is_file() else None
+    blend_mode = blend_parsed.document["materials"][0].get("alphaMode") if blend_parsed else None
+    results.check("定数Alpha Blendを書き出す", not blend_errors and blend_status == JobStatus.SUCCEEDED and blend_mode == "BLEND", "; ".join(str(error) for error in blend_job.errors))
+
+    continuous_material, continuous_principled, _ = make_principled_material("ContinuousAlpha")
+    continuous_material.surface_render_method = "DITHERED"
+    continuous_principled.inputs["Base Color"].default_value = (0.05, 0.2, 0.9, 1.0)
+    continuous_noise = continuous_material.node_tree.nodes.new("ShaderNodeTexNoise")
+    continuous_material.node_tree.links.new(continuous_noise.outputs["Fac"], continuous_principled.inputs["Alpha"])
+    continuous_obj = make_cube("ContinuousAlphaObject", continuous_material, (21.0, 0.0, 0.0))
+    select_only(continuous_obj)
+    continuous_output = temp_root / "continuous_alpha.glb"
+    continuous_job = BakeJob(bpy.context, BakeJobConfig(continuous_output, 512))
+    continuous_status = continuous_job.run_to_completion()
+    continuous_parsed = parse_glb(continuous_output) if continuous_output.is_file() else None
+    continuous_mode = continuous_parsed.document["materials"][0].get("alphaMode") if continuous_parsed else None
+    results.check("連続AlphaとAlpha Hashed相当をBLENDで書き出す", continuous_status == JobStatus.SUCCEEDED and continuous_mode == "BLEND", "; ".join(str(error) for error in continuous_job.errors))
+    if continuous_parsed:
+        continuous_pbr = continuous_parsed.document["materials"][0]["pbrMetallicRoughness"]
+        continuous_image_index = texture_image_index(continuous_parsed.document, continuous_pbr["baseColorTexture"]["index"])
+        continuous_image = load_embedded_image(continuous_parsed, continuous_image_index, temp_root, "sRGB")
+        continuous_values = image_pixels(continuous_image)
+        fractional_alpha = [continuous_values[index + 3] for index in range(0, len(continuous_values), 4) if 0.02 < continuous_values[index + 3] < 0.98]
+        results.check("連続Alphaの中間値をRGBA PNGへ保持する", bool(fractional_alpha) and max(fractional_alpha) - min(fractional_alpha) > 0.1)
+        bpy.data.images.remove(continuous_image)
+    else:
+        results.check("連続Alphaの中間値をRGBA PNGへ保持する", False, "連続Alpha GLBがありません")
+
+    bpy.ops.mesh.primitive_cube_add(location=(24.0, 0.0, 0.0))
+    missing_obj = bpy.context.object
+    missing_obj.name = "MissingMaterialObject"
+    select_only(missing_obj)
+    missing_output = temp_root / "missing_material.glb"
+    missing_job = BakeJob(bpy.context, BakeJobConfig(missing_output, 512))
+    missing_status = missing_job.run_to_completion()
+    results.check("未割当Materialを既定PBRで書き出す", missing_status == JobStatus.SUCCEEDED and missing_output.is_file() and any("未割当" in warning.reason for warning in missing_job.warnings), "; ".join(str(error) for error in missing_job.errors))
+
+    khr_material, khr_principled, khr_output = make_principled_material("KhrMaterial")
+    khr_principled.inputs["Transmission Weight"].default_value = 0.35
+    khr_principled.inputs["IOR"].default_value = 1.33
+    khr_principled.inputs["Specular IOR Level"].default_value = 0.8
+    khr_principled.inputs["Specular Tint"].default_value = (0.8, 0.7, 0.6, 1.0)
+    khr_principled.inputs["Coat Weight"].default_value = 0.45
+    khr_principled.inputs["Coat Roughness"].default_value = 0.2
+    khr_principled.inputs["Sheen Weight"].default_value = 0.3
+    khr_principled.inputs["Sheen Tint"].default_value = (0.7, 0.2, 0.1, 1.0)
+    khr_principled.inputs["Sheen Roughness"].default_value = 0.4
+    khr_principled.inputs["Anisotropic"].default_value = 0.5
+    khr_principled.inputs["Anisotropic Rotation"].default_value = 0.25
+    settings_group = bpy.data.node_groups.new("glTF Material Output Test", "ShaderNodeTree")
+    settings_group.interface.new_socket(name="Occlusion", in_out="INPUT", socket_type="NodeSocketFloat")
+    settings_group.interface.new_socket(name="Thickness", in_out="INPUT", socket_type="NodeSocketFloat")
+    settings_group.nodes.new("NodeGroupOutput")
+    settings_group.nodes.new("NodeGroupInput")
+    settings_node = khr_material.node_tree.nodes.new("ShaderNodeGroup")
+    settings_node.node_tree = settings_group
+    settings_node.inputs["Occlusion"].default_value = 0.8
+    settings_node.inputs["Thickness"].default_value = 0.6
+    volume = khr_material.node_tree.nodes.new("ShaderNodeVolumePrincipled")
+    volume.inputs["Color"].default_value = (0.9, 0.8, 0.7, 1.0)
+    volume.inputs["Density"].default_value = 0.25
+    khr_material.node_tree.links.new(volume.outputs["Volume"], khr_output.inputs["Volume"])
+    khr_obj = make_cube("KhrObject", khr_material, (27.0, 0.0, 0.0))
+    select_only(khr_obj)
+    khr_path = temp_root / "khr.glb"
+    khr_job = BakeJob(bpy.context, BakeJobConfig(khr_path, 512))
+    khr_status = khr_job.run_to_completion()
+    khr_parsed = parse_glb(khr_path) if khr_path.is_file() else None
+    khr_extensions = set(khr_parsed.document["materials"][0].get("extensions", {})) if khr_parsed else set()
+    expected_khr = {
+        "KHR_materials_transmission",
+        "KHR_materials_ior",
+        "KHR_materials_specular",
+        "KHR_materials_clearcoat",
+        "KHR_materials_sheen",
+        "KHR_materials_anisotropy",
+        "KHR_materials_volume",
+    }
+    results.check("Principledの主要KHR材質拡張を書き出す", khr_status == JobStatus.SUCCEEDED and expected_khr.issubset(khr_extensions), f"extensions={sorted(khr_extensions)}; errors={'; '.join(str(error) for error in khr_job.errors)}")
+
+    unlit_material = bpy.data.materials.new("UnlitMaterial")
+    unlit_material.use_nodes = True
+    unlit_tree = unlit_material.node_tree
+    unlit_tree.nodes.clear()
+    unlit_output = unlit_tree.nodes.new("ShaderNodeOutputMaterial")
+    unlit_emission = unlit_tree.nodes.new("ShaderNodeEmission")
+    unlit_emission.inputs["Color"].default_value = (0.2, 0.7, 0.4, 1.0)
+    unlit_tree.links.new(unlit_emission.outputs[0], unlit_output.inputs["Surface"])
+    unlit_obj = make_cube("UnlitObject", unlit_material, (30.0, 0.0, 0.0))
+    select_only(unlit_obj)
+    unlit_path = temp_root / "unlit.glb"
+    unlit_job = BakeJob(bpy.context, BakeJobConfig(unlit_path, 512))
+    unlit_status = unlit_job.run_to_completion()
+    unlit_parsed = parse_glb(unlit_path) if unlit_path.is_file() else None
+    unlit_extensions = unlit_parsed.document["materials"][0].get("extensions", {}) if unlit_parsed else {}
+    results.check("Emission材質をKHR_materials_unlitで書き出す", unlit_status == JobStatus.SUCCEEDED and "KHR_materials_unlit" in unlit_extensions, "; ".join(str(error) for error in unlit_job.errors))
+
+    results.check("拡張子なし保存名へ.glbを追加する", ensure_glb_extension("C:/tmp/model") == "C:/tmp/model.glb" and ensure_glb_extension("C:/tmp/model.glb") == "C:/tmp/model.glb")
+    results.check("保存済みBlend名を初期GLB名にする", default_export_filepath("C:/scene/example.blend", "Cube", "", "C:/tmp").replace("\\", "/") == "C:/scene/example.glb")
+    results.check("未保存時はActive Mesh名を初期GLB名にする", default_export_filepath("", "Active Cube", "", "C:/tmp").replace("\\", "/").endswith("/Active_Cube.glb"))
+    results.check("前回保存先を再利用する", default_export_filepath("C:/scene/example.blend", "Cube", "D:/last/output.glb", "C:/tmp").replace("\\", "/") == "D:/last/output.glb")
 
     # 失敗とキャンセルは定数材質で高速に検証する。
     constant_material, constant_principled, _ = make_principled_material("ConstantMaterial")
@@ -404,6 +520,14 @@ def run() -> TestResults:
         )
         if destination.is_file():
             print(f"INTEGRATION_GLB: {destination}")
+
+    visual_directory = os.environ.get("SHADER_BAKE_GLB_VISUAL_DIR", "")
+    if visual_directory:
+        destination = Path(visual_directory)
+        destination.mkdir(parents=True, exist_ok=True)
+        for source in (continuous_output, temp_root / "mix.glb"):
+            if source.is_file():
+                shutil.copy2(source, destination / source.name)
 
     shutil.rmtree(temp_root, ignore_errors=True)
     return results
