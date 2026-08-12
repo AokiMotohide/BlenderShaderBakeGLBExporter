@@ -32,6 +32,7 @@ Shader Bake GLB Exporterは、選択したMeshの接続済みシェーダーをP
 - 標準GLB 2.0
 - 選択Meshだけを出力
 - 選択Mesh間の親子関係と、配置に必要なEmpty祖先をglTF Node階層として保持
+- 選択Meshがdepsgraph上に生成するParticle等の静的Mesh instanceを親Node配下へ展開し、ベイク済みMesh定義を共有
 - Base Color + Alpha: RGBA PNG、sRGB
 - ORM: RGB PNG、Linear、R=Occlusion、G=Roughness、B=Metallic
 - Normal: tangent-space RGB PNG、Linear
@@ -71,6 +72,7 @@ glTFにはAlpha Hashedと同一のモードがないため、連続Alphaとし�
 
 - 近似材質は元Shaderとの物理的・視線依存な完全一致を保証しません。
 - VolumeとShader DisplacementはGLBで保持できる範囲だけを出力し、それ以外は省略して警告します。
+- instanceは現在フレームの静的配置として出力します。時間変化するinstance Animationは保持しません。
 - Animation、Skin、Morph、Camera、Light、Draco、gltfpack、Custom Propertiesは出力しません。
 - 解像度は全Objectと全Material Slotへ共通で適用します。512、1024、2048から選択します。
 

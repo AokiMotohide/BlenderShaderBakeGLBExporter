@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 from pathlib import Path
 from typing import Callable, Iterable
 
 import bpy
+from mathutils import Matrix
 
 from .bake import (
     BakeFailure,
@@ -50,6 +52,16 @@ class JobStep:
     object_name: str
     material_name: str
     action: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class StaticObjectInstance:
+    """選択Meshがdepsgraph上に生成した静的Mesh instanceの出力情報。"""
+
+    source: bpy.types.Object
+    parent: bpy.types.Object
+    matrix_world: Matrix
+    persistent_id: tuple[int, ...]
 
 
 @dataclass
@@ -137,6 +149,8 @@ class BakeJob:
         self.scene: bpy.types.Scene | None = None
         self.collection: bpy.types.Collection | None = None
         self.work_objects: list[WorkObject] = []
+        self.static_instances: list[StaticObjectInstance] = []
+        self._instance_only_source_pointers: set[int] = set()
         self.pending_glb: PendingGlb | None = None
         self._steps: list[JobStep] = []
         self._step_index = 0
@@ -180,6 +194,46 @@ class BakeJob:
             except RuntimeError as exc:
                 raise BakeFailure(f"Object Modeへ移行できません: {exc}") from exc
 
+    def _capture_static_instances(self) -> list[bpy.types.Object]:
+        """選択Meshが生成したinstanceを元SceneのdepsgraphからJob所有情報へ固定する。"""
+
+        selected_pointers = {obj.as_pointer() for obj in self.objects}
+        source_objects: dict[int, bpy.types.Object] = {}
+        depsgraph = self.context.evaluated_depsgraph_get()
+        for instance in depsgraph.object_instances:
+            if not instance.is_instance or instance.parent is None:
+                continue
+            parent = getattr(instance.parent, "original", instance.parent)
+            if parent.as_pointer() not in selected_pointers:
+                continue
+            evaluated_source = instance.instance_object or instance.object
+            source = getattr(evaluated_source, "original", evaluated_source)
+            if source.type != "MESH" or source.data is None or not source.data.polygons:
+                self._warn(parent.name, source.name, "Mesh以外またはFaceなしの静的instanceを除外しました")
+                continue
+            matrix_world = instance.matrix_world.copy()
+            if not all(
+                math.isfinite(float(matrix_world[row][column]))
+                for row in range(4)
+                for column in range(4)
+            ):
+                self._warn(parent.name, source.name, "非有限transformを持つ静的instanceを除外しました")
+                continue
+            persistent_id = tuple(
+                int(value)
+                for value in instance.persistent_id
+                if int(value) != 2147483647
+            )
+            self.static_instances.append(
+                StaticObjectInstance(source, parent, matrix_world, persistent_id)
+            )
+            source_objects[source.as_pointer()] = source
+        return [
+            source
+            for pointer, source in source_objects.items()
+            if pointer not in selected_pointers
+        ]
+
     def start(self) -> None:
         if self.status != JobStatus.READY:
             raise RuntimeError("Jobは開始済みです")
@@ -189,8 +243,12 @@ class BakeJob:
         self._snapshot = self._capture_context()
         try:
             self._ensure_original_object_mode()
+            instance_only_sources = self._capture_static_instances()
+            self._instance_only_source_pointers = {
+                source.as_pointer() for source in instance_only_sources
+            }
             self.scene, self.collection = create_job_scene(self.context.scene, self.registry)
-            for original in self.objects:
+            for original in [*self.objects, *instance_only_sources]:
                 try:
                     self.work_objects.append(
                         create_work_object(self.context, original, self.scene, self.collection, self.registry, self._warn)
@@ -245,6 +303,7 @@ class BakeJob:
             export_scene.collection.children.link(export_collection)
             export_work_objects: list[WorkObject] = []
             export_nodes: dict[int, bpy.types.Object] = {}
+            export_sources: dict[int, WorkObject] = {}
             for work in self.work_objects:
                 export_mesh = self.registry.track(work.object.data.copy())
                 export_object = self.registry.track(
@@ -252,14 +311,20 @@ class BakeJob:
                 )
                 export_object.matrix_world = work.object.matrix_world.copy()
                 export_collection.objects.link(export_object)
-                export_work_objects.append(WorkObject(work.original, export_object, work.bake_uv_name, work.slots))
-                export_nodes[work.original.as_pointer()] = export_object
+                export_work = WorkObject(work.original, export_object, work.bake_uv_name, work.slots)
+                export_work_objects.append(export_work)
+                source_pointer = work.original.as_pointer()
+                export_sources[source_pointer] = export_work
+                if source_pointer not in self._instance_only_source_pointers:
+                    export_nodes[source_pointer] = export_object
 
             # 選択Meshの祖先は形状を持たない構造Nodeとして複製する。
             # world matrixを固定した後に親を設定し、元階層のlocal transformを再現する。
             ancestors: list[bpy.types.Object] = []
             seen_ancestors: set[int] = set()
             for work in self.work_objects:
+                if work.original.as_pointer() in self._instance_only_source_pointers:
+                    continue
                 parent = work.original.parent
                 while parent is not None:
                     pointer = parent.as_pointer()
@@ -288,6 +353,8 @@ class BakeJob:
 
             for work in export_work_objects:
                 original = work.original
+                if original.as_pointer() in self._instance_only_source_pointers:
+                    continue
                 parent = original.parent
                 if parent is None:
                     continue
@@ -308,13 +375,36 @@ class BakeJob:
                 world = proxy.matrix_world.copy()
                 proxy.parent = export_parent
                 proxy.matrix_world = world
+
+            hierarchy_objects = list(export_nodes.values())
+            for index, instance in enumerate(self.static_instances):
+                source_work = export_sources.get(instance.source.as_pointer())
+                export_parent = export_nodes.get(instance.parent.as_pointer())
+                if source_work is None:
+                    self._warn(instance.parent.name, instance.source.name, "静的instanceのベイク済みMeshを取得できないため除外しました")
+                    continue
+                instance_object = self.registry.track(
+                    bpy.data.objects.new(
+                        f"{instance.source.name}__BAKED_INSTANCE_{index:04d}",
+                        source_work.object.data,
+                    )
+                )
+                instance_object.matrix_world = instance.matrix_world.copy()
+                export_collection.objects.link(instance_object)
+                if export_parent is not None:
+                    world = instance_object.matrix_world.copy()
+                    instance_object.parent = export_parent
+                    instance_object.matrix_world = world
+                else:
+                    self._warn(instance.parent.name, instance.source.name, "静的instanceの親Nodeを取得できないためrootへ配置しました")
+                hierarchy_objects.append(instance_object)
             if self.context.window:
                 self.context.window.scene = export_scene
             self.pending_glb = export_to_temporary_glb(
                 self.context,
                 export_scene,
                 export_work_objects,
-                list(export_nodes.values()),
+                hierarchy_objects,
                 self.config.output_path,
             )
 

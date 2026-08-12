@@ -8,7 +8,7 @@ Principled BSDFのglTF対応入力はPBRおよびKHR材質へ変換します。�
 
 元Object、Mesh、Material、Node、Image、UV、Modifierは変更しません。一時データは成功、失敗、キャンセルの全経路で削除されます。
 
-選択Mesh間の親子関係と、配置に必要なEmpty祖先はglTF Node階層として複製されます。各Meshのworld transformは標準glTF exporterのY-up変換を含めて保持されます。Animation、Skin、Morphは出力しません。
+選択Mesh間の親子関係と、配置に必要なEmpty祖先はglTF Node階層として複製されます。選択MeshがParticle等で生成した静的Mesh instanceも、現在フレームの配置を親Node配下へ展開し、ベイク済みMesh定義を共有します。各Meshのworld transformは標準glTF exporterのY-up変換を含めて保持されます。Animation、Skin、Morphは出力しません。
 
 ## 2. 動作環境
 
@@ -152,11 +152,13 @@ Sidebarには進捗、処理中Object、Material、チャンネルが表示さ�
 - gltfpack
 - Custom Properties
 
+instanceの時間変化はAnimationとして出力せず、書き出し時の現在フレームを静的配置として固定します。
+
 ## 12. 安全性
 
 元データは直接変更しません。Modifier適用済みMesh、Material、Node、Image、UV、Node GroupなどはJob専用コピーとして作成されます。
 
-生成GLBは最終保存先と同じフォルダの一時ファイルへ出力します。GLB 2.0構造、Node階層、TRS/matrix、Mesh/Material参照、単一Bake UV契約、Alpha、主要factor、KHR拡張、PNGを検証し、成功した場合だけ最終パスへ原子的に置換します。失敗時は既存の正常なGLBを維持します。
+生成GLBは最終保存先と同じフォルダの一時ファイルへ出力します。GLB 2.0構造、Node階層、TRS/matrix、静的instanceを含むMesh/Material参照、単一Bake UV契約、Alpha、主要factor、KHR拡張、PNGを検証し、成功した場合だけ最終パスへ原子的に置換します。失敗時は既存の正常なGLBを維持します。
 
 標準exporterがTangentを生成できないMeshでは、TangentはglTF仕様どおり省略されます。読込側はPOSITION、NORMAL、TEXCOORDからTangentを再生成できます。
 

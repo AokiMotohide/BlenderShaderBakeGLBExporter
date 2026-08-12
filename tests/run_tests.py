@@ -561,6 +561,75 @@ def run() -> TestResults:
     else:
         results.check("GLB再import後もMeshのworld transformを保持する", False, "階層GLBがありません")
 
+    instance_material, _, _ = make_principled_material("StaticInstanceMaterial")
+    instance_source = make_cube("StaticInstanceSource", instance_material, (8.0, 0.0, 0.0))
+    instance_emitter = make_cube("StaticInstanceEmitter", instance_material, (10.0, 0.0, 0.0))
+    select_only(instance_emitter)
+    bpy.ops.object.particle_system_add()
+    particle_settings = instance_emitter.particle_systems[-1].settings
+    particle_settings.count = 3
+    particle_settings.frame_start = 1.0
+    particle_settings.frame_end = 1.0
+    particle_settings.lifetime = 100.0
+    particle_settings.physics_type = "NO"
+    particle_settings.render_type = "OBJECT"
+    particle_settings.instance_object = instance_source
+    particle_settings.particle_size = 0.25
+    bpy.context.scene.frame_set(2)
+    bpy.context.view_layer.update()
+    expected_instance_world = []
+    for depsgraph_instance in bpy.context.evaluated_depsgraph_get().object_instances:
+        parent = getattr(depsgraph_instance.parent, "original", depsgraph_instance.parent)
+        if depsgraph_instance.is_instance and parent == instance_emitter:
+            expected_instance_world.append(matrix_signature(depsgraph_instance.matrix_world))
+    instance_output = temp_root / "static_instances.glb"
+    select_only(instance_source, instance_emitter)
+    instance_job = BakeJob(bpy.context, BakeJobConfig(instance_output, 512))
+    instance_status = instance_job.run_to_completion()
+    instance_document = parse_glb(instance_output).document if instance_output.is_file() else {}
+    instance_nodes = instance_document.get("nodes", [])
+    instance_indices = {node.get("name", ""): index for index, node in enumerate(instance_nodes)}
+    source_node_index = instance_indices.get("StaticInstanceSource__BAKED")
+    emitter_node_index = instance_indices.get("StaticInstanceEmitter__BAKED")
+    generated_indices = [
+        index
+        for name, index in instance_indices.items()
+        if name.startswith("StaticInstanceSource__BAKED_INSTANCE_")
+    ]
+    shared_mesh = instance_nodes[source_node_index].get("mesh") if source_node_index is not None else None
+    static_instance_contract_ok = (
+        instance_status == JobStatus.SUCCEEDED
+        and len(expected_instance_world) == 3
+        and len(instance_nodes) == 5
+        and len(instance_document.get("meshes", [])) == 2
+        and len(generated_indices) == 3
+        and source_node_index is not None
+        and emitter_node_index is not None
+        and all(instance_nodes[index].get("mesh") == shared_mesh for index in generated_indices)
+        and all(index in instance_nodes[emitter_node_index].get("children", []) for index in generated_indices)
+    )
+    results.check(
+        "depsgraph静的instanceを親Node配下へ出力しMesh定義を共有する",
+        static_instance_contract_ok,
+        f"nodes={len(instance_nodes)} meshes={len(instance_document.get('meshes', []))} generated={len(generated_indices)} errors={'; '.join(str(error) for error in instance_job.errors)}",
+    )
+    if instance_output.is_file():
+        before_import = {obj.as_pointer() for obj in bpy.data.objects}
+        bpy.ops.import_scene.gltf(filepath=str(instance_output))
+        imported_instance_world = sorted(
+            matrix_signature(obj.matrix_world)
+            for obj in bpy.data.objects
+            if obj.as_pointer() not in before_import
+            and obj.name.startswith("StaticInstanceSource__BAKED_INSTANCE_")
+        )
+        results.check(
+            "静的instanceのworld transformをGLB再import後も保持する",
+            imported_instance_world == sorted(expected_instance_world),
+            f"expected={expected_instance_world}; actual={imported_instance_world}",
+        )
+    else:
+        results.check("静的instanceのworld transformをGLB再import後も保持する", False, "静的instance GLBがありません")
+
     results.check("拡張子なし保存名へ.glbを追加する", ensure_glb_extension("C:/tmp/model") == "C:/tmp/model.glb" and ensure_glb_extension("C:/tmp/model.glb") == "C:/tmp/model.glb")
     results.check("保存済みBlend名を初期GLB名にする", default_export_filepath("C:/scene/example.blend", "Cube", "", "C:/tmp").replace("\\", "/") == "C:/scene/example.glb")
     results.check("未保存時はActive Mesh名を初期GLB名にする", default_export_filepath("", "Active Cube", "", "C:/tmp").replace("\\", "/").endswith("/Active_Cube.glb"))

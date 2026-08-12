@@ -71,13 +71,31 @@ def run() -> int:
             expected_parent[f"{obj.name}__BAKED"] = f"{obj.parent.name}__BAKED"
         else:
             expected_parent[f"{obj.name}__BAKED"] = f"{obj.parent.name}__BAKED_HIERARCHY"
+    static_instance_count = 0
+    for depsgraph_instance in bpy.context.evaluated_depsgraph_get().object_instances:
+        if not depsgraph_instance.is_instance or depsgraph_instance.parent is None:
+            continue
+        parent = getattr(depsgraph_instance.parent, "original", depsgraph_instance.parent)
+        if parent.as_pointer() not in selected_pointers:
+            continue
+        evaluated_source = depsgraph_instance.instance_object or depsgraph_instance.object
+        source = getattr(evaluated_source, "original", evaluated_source)
+        if source.type != "MESH" or source.data is None or not source.data.polygons:
+            continue
+        name = f"{source.name}__BAKED_INSTANCE_{static_instance_count:04d}"
+        expected_world[name] = matrix_values(depsgraph_instance.matrix_world)
+        expected_parent[name] = f"{parent.name}__BAKED"
+        static_instance_count += 1
     for obj in bpy.context.scene.objects:
         obj.select_set(obj in meshes)
     bpy.context.view_layer.objects.active = meshes[0] if meshes else None
 
     job = BakeJob(bpy.context, BakeJobConfig(output, resolution), meshes)
     status = job.run_to_completion()
-    print(f"FIXTURE_JOB: status={status.value} meshes={len(meshes)} warnings={len(job.warnings)} errors={len(job.errors)}")
+    print(
+        f"FIXTURE_JOB: status={status.value} meshes={len(meshes)} "
+        f"staticInstances={static_instance_count} warnings={len(job.warnings)} errors={len(job.errors)}"
+    )
     for warning in job.warnings:
         print(f"FIXTURE_WARNING: {warning}")
     for error in job.errors:
@@ -128,7 +146,8 @@ def run() -> int:
     ]
     print(
         "FIXTURE_ROUNDTRIP: "
-        f"importedMeshes={len(imported)} transformMismatches={len(transform_mismatches)} "
+        f"expectedMeshes={len(expected_world)} importedMeshes={len(imported)} "
+        f"transformMismatches={len(transform_mismatches)} "
         f"hierarchyMismatches={len(hierarchy_mismatches)}"
     )
     if transform_mismatches:

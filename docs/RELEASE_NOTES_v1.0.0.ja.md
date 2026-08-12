@@ -15,6 +15,7 @@
 
 - 選択したMeshだけをGLBへ出力
 - 選択Mesh間の階層と配置に必要なEmpty祖先をglTF Nodeとして保持
+- 選択Meshが生成するParticle等の静的Mesh instanceを親Node配下へ展開し、ベイク済みMesh定義を共有
 - Base Color + Alpha、ORM、Normal、Emissiveを8bit PNGへベイク
 - 全texture slotを単一Bake UVと`TEXCOORD_0`へ統一
 - 定数Base Color、Alpha、Metallic、Roughness、Emissive、IORを標準factorとして保持
@@ -36,19 +37,19 @@
 
 ## 制約
 
-外観近似した材質は、元Shaderとの物理的・視線依存な完全一致を保証しません。Animation、Skin、Morph、Camera、Light、Draco、gltfpack、Custom Propertiesは出力しません。
+外観近似した材質は、元Shaderとの物理的・視線依存な完全一致を保証しません。instanceは現在フレームの静的配置として出力します。Animation、Skin、Morph、Camera、Light、Draco、gltfpack、Custom Propertiesは出力しません。
 
 Blender 5.1.1以外での動作は保証していません。詳細は[日本語マニュアル](https://github.com/AokiMotohide/BlenderShaderBakeGLBExporter/blob/v1.0.0/docs/USER_MANUAL.ja.md)を確認してください。
 
 ## 検証
 
 - Blender 5.1.1 `--background --factory-startup --disable-autoexec`
-- 完全変換、KHR材質、連続Alpha、Alpha Clip、任意Shader近似、Materialフォールバック、再import、原子的置換を含む自動テスト
-- Node階層、world transform、単一UV契約、material factor、実シーンcold/hot再読込を含む互換性検証
+- 完全変換、KHR材質、連続Alpha、Alpha Clip、任意Shader近似、Materialフォールバック、静的instance、再import、原子的置換を含む自動テスト44件
+- 219 Node / 68 Meshの実シーンで、world transform、階層、単一UV契約、material factor、cold/hot再読込、world bounds一致を確認
 - Blender Extension検証
 - 配布ZIP内容検証
 
 ## 配布ZIPの検証情報
 
-- ファイルサイズ: 31,501 bytes
-- SHA-256: `C9B8E4A1AB4DFD120471CA199C83756DDDC8A6E6C8FF52BDB6EB8E8DD7B3A322`
+- ファイルサイズ: 32,395 bytes
+- SHA-256: `ECEF61E576DBE14178648657EB2F153C00890060FF88C7AE34D6C750DBCA7F09`
