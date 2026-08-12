@@ -244,6 +244,7 @@ class BakeJob:
             )
             export_scene.collection.children.link(export_collection)
             export_work_objects: list[WorkObject] = []
+            export_nodes: dict[int, bpy.types.Object] = {}
             for work in self.work_objects:
                 export_mesh = self.registry.track(work.object.data.copy())
                 export_object = self.registry.track(
@@ -252,12 +253,68 @@ class BakeJob:
                 export_object.matrix_world = work.object.matrix_world.copy()
                 export_collection.objects.link(export_object)
                 export_work_objects.append(WorkObject(work.original, export_object, work.bake_uv_name, work.slots))
+                export_nodes[work.original.as_pointer()] = export_object
+
+            # 選択Meshの祖先は形状を持たない構造Nodeとして複製する。
+            # world matrixを固定した後に親を設定し、元階層のlocal transformを再現する。
+            ancestors: list[bpy.types.Object] = []
+            seen_ancestors: set[int] = set()
+            for work in self.work_objects:
+                parent = work.original.parent
+                while parent is not None:
+                    pointer = parent.as_pointer()
+                    if pointer not in export_nodes and pointer not in seen_ancestors:
+                        ancestors.append(parent)
+                        seen_ancestors.add(pointer)
+                    parent = parent.parent
+            def hierarchy_depth(obj: bpy.types.Object) -> int:
+                depth = 0
+                parent = obj.parent
+                while parent is not None:
+                    depth += 1
+                    parent = parent.parent
+                return depth
+
+            ancestors.sort(key=hierarchy_depth)
+            depsgraph = self.context.evaluated_depsgraph_get()
+            for original in ancestors:
+                proxy = self.registry.track(
+                    bpy.data.objects.new(f"{original.name}__BAKED_HIERARCHY", None)
+                )
+                proxy.empty_display_type = "PLAIN_AXES"
+                proxy.matrix_world = original.evaluated_get(depsgraph).matrix_world.copy()
+                export_collection.objects.link(proxy)
+                export_nodes[original.as_pointer()] = proxy
+
+            for work in export_work_objects:
+                original = work.original
+                parent = original.parent
+                if parent is None:
+                    continue
+                export_parent = export_nodes.get(parent.as_pointer())
+                if export_parent is None:
+                    continue
+                world = work.object.matrix_world.copy()
+                work.object.parent = export_parent
+                work.object.matrix_world = world
+            for original in ancestors:
+                parent = original.parent
+                if parent is None:
+                    continue
+                proxy = export_nodes[original.as_pointer()]
+                export_parent = export_nodes.get(parent.as_pointer())
+                if export_parent is None:
+                    continue
+                world = proxy.matrix_world.copy()
+                proxy.parent = export_parent
+                proxy.matrix_world = world
             if self.context.window:
                 self.context.window.scene = export_scene
             self.pending_glb = export_to_temporary_glb(
                 self.context,
                 export_scene,
                 export_work_objects,
+                list(export_nodes.values()),
                 self.config.output_path,
             )
 

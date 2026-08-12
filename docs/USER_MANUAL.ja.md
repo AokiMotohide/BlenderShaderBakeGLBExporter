@@ -8,6 +8,8 @@ Principled BSDFのglTF対応入力はPBRおよびKHR材質へ変換します。�
 
 元Object、Mesh、Material、Node、Image、UV、Modifierは変更しません。一時データは成功、失敗、キャンセルの全経路で削除されます。
 
+選択Mesh間の親子関係と、配置に必要なEmpty祖先はglTF Node階層として複製されます。各Meshのworld transformは標準glTF exporterのY-up変換を含めて保持されます。Animation、Skin、Morphは出力しません。
+
 ## 2. 動作環境
 
 - Windows
@@ -73,6 +75,10 @@ Active Material OutputのSurfaceへPrincipled BSDFが直接接続されている
 - glTF Material OutputのThicknessとPrincipled Volume
 
 必要に応じて`KHR_materials_transmission`、`KHR_materials_ior`、`KHR_materials_specular`、`KHR_materials_clearcoat`、`KHR_materials_sheen`、`KHR_materials_anisotropy`、`KHR_materials_volume`、`KHR_materials_emissive_strength`を出力します。Emissionだけの材質は`KHR_materials_unlit`として出力します。
+
+Base Color、Alpha、Metallic、Roughness、Emissiveの定数入力は、ベイク画像から分離して標準glTF factorへ保持します。Procedural入力や外観近似では分離できる定数がないため、評価後の値をtextureへ平坦化し、factorを中立値にします。IORは`KHR_materials_ior`の値として保持します。
+
+すべての出力textureは同じBake UVへ評価され、`TEXCOORD_0`を使います。元材質のUV setやMapping差は画像とBake UVへ取り込まれるため、出力材質内でtextureごとに異なるUV setやtransformは発生しません。
 
 Principled入力へ接続された、Cyclesで評価可能な手続き型テクスチャやNode Groupもベイクできます。
 
@@ -150,7 +156,9 @@ Sidebarには進捗、処理中Object、Material、チャンネルが表示さ�
 
 元データは直接変更しません。Modifier適用済みMesh、Material、Node、Image、UV、Node GroupなどはJob専用コピーとして作成されます。
 
-生成GLBは最終保存先と同じフォルダの一時ファイルへ出力します。GLB 2.0構造、必要Attribute、Material、PNG、Alpha、KHR拡張を検証し、成功した場合だけ最終パスへ原子的に置換します。失敗時は既存の正常なGLBを維持します。
+生成GLBは最終保存先と同じフォルダの一時ファイルへ出力します。GLB 2.0構造、Node階層、TRS/matrix、Mesh/Material参照、単一Bake UV契約、Alpha、主要factor、KHR拡張、PNGを検証し、成功した場合だけ最終パスへ原子的に置換します。失敗時は既存の正常なGLBを維持します。
+
+標準exporterがTangentを生成できないMeshでは、TangentはglTF仕様どおり省略されます。読込側はPOSITION、NORMAL、TEXCOORDからTangentを再生成できます。
 
 ## 13. アンインストール
 

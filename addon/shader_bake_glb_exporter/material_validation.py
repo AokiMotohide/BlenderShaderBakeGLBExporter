@@ -36,6 +36,11 @@ class MaterialAnalysis:
     occlusion_socket: bpy.types.NodeSocket | None = None
     thickness_socket: bpy.types.NodeSocket | None = None
     volume_node: bpy.types.Node | None = None
+    base_color_factor: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
+    metallic_factor: float = 1.0
+    roughness_factor: float = 1.0
+    emission_color_factor: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    emission_strength_factor: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -302,6 +307,37 @@ def analyze_material(material: bpy.types.Material, object_name: str = "") -> Mat
         reasons.append("VolumeをCore PBR外観へ近似し、体積効果は省略します")
 
     strategy = "FALLBACK" if reasons else "PBR"
+    base_color_socket = _socket(principled, "Base Color")
+    if base_color_socket.is_linked:
+        base_color_factor = (1.0, 1.0, 1.0, 1.0)
+    else:
+        base_default = _as_tuple(base_color_socket.default_value)
+        alpha_socket = _socket(principled, "Alpha")
+        alpha_factor = 1.0 if alpha_socket.is_linked else min(1.0, max(0.0, _finite_or(_constant(alpha_socket), 1.0)))
+        base_color_factor = tuple(
+            min(1.0, max(0.0, _finite_or(base_default[index], 1.0)))
+            for index in range(3)
+        ) + (alpha_factor,)
+    metallic_socket = _socket(principled, "Metallic")
+    metallic_factor = 1.0 if metallic_socket.is_linked else min(1.0, max(0.0, _finite_or(_constant(metallic_socket), 0.0)))
+    roughness_socket = _socket(principled, "Roughness")
+    roughness_factor = 1.0 if roughness_socket.is_linked else min(1.0, max(0.0, _finite_or(_constant(roughness_socket), 0.5)))
+    emission_color_socket = _socket(principled, "Emission Color")
+    emission_strength_socket = _socket(principled, "Emission Strength")
+    if emission_color_socket.is_linked or emission_strength_socket.is_linked:
+        emission_color_factor = (1.0, 1.0, 1.0)
+        emission_strength_factor = 1.0
+    else:
+        emission_default = tuple(max(0.0, _finite_or(value, 0.0)) for value in _as_tuple(emission_color_socket.default_value)[:3])
+        source_strength = max(0.0, _finite_or(_constant(emission_strength_socket), 1.0))
+        if max(emission_default, default=0.0) * source_strength <= EPSILON:
+            # ゼロ発光は黒Textureとして残し、標準exporterによるslot省略を避ける。
+            emission_color_factor = (1.0, 1.0, 1.0)
+            emission_strength_factor = 1.0
+        else:
+            color_scale = max(1.0, *emission_default)
+            emission_color_factor = tuple(min(1.0, value / color_scale) for value in emission_default)
+            emission_strength_factor = source_strength * color_scale
     return MaterialAnalysis(
         material,
         output,
@@ -314,6 +350,11 @@ def analyze_material(material: bpy.types.Material, object_name: str = "") -> Mat
         occlusion,
         thickness,
         volume_node,
+        base_color_factor,
+        metallic_factor,
+        roughness_factor,
+        emission_color_factor,
+        emission_strength_factor,
     )
 
 

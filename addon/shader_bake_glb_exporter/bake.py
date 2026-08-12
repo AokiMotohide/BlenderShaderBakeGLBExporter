@@ -727,6 +727,14 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
     result = slot.result
     count = resolution * resolution
     fallback = slot.source_analysis.strategy == "FALLBACK"
+    base_factor = slot.source_analysis.base_color_factor if slot.source_analysis.strategy == "PBR" else (1.0, 1.0, 1.0, 1.0)
+    metallic_factor = slot.source_analysis.metallic_factor if slot.source_analysis.strategy == "PBR" else 1.0
+    roughness_factor = slot.source_analysis.roughness_factor if slot.source_analysis.strategy == "PBR" else 1.0
+
+    def remove_factor(value: float, factor: float) -> float:
+        # factor=0ではtexture値が外観へ寄与しないため、白へ正規化する。
+        return 1.0 if factor <= 1.0e-6 else _clamp01(value / factor)
+
     base_ready = {"Base Color", "Alpha"}.issubset(result.raw) and (not fallback or "Transmission" in result.raw)
     if "base_alpha" not in result.images and base_ready:
         base_values, base_constant = _raw_values(result.raw["Base Color"])
@@ -746,8 +754,8 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
                     value = _sample(transmission_values, transmission_constant, pixel, component)
                 if fallback and alpha > 1.0e-6:
                     value /= alpha
-                pixels[offset + component] = _clamp01(value)
-            pixels[offset + 3] = alpha
+                pixels[offset + component] = remove_factor(value, base_factor[component])
+            pixels[offset + 3] = remove_factor(alpha, base_factor[3])
         result.images["base_alpha"] = _write_final_image(registry, f"{stem}_BaseColorAlpha", resolution, "sRGB", pixels)
         _release_raw(registry, result, "Base Color", "Alpha")
         if fallback:
@@ -773,8 +781,8 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
         for pixel in range(count):
             offset = pixel * 4
             pixels[offset] = _clamp01(_sample(occlusion_values, occlusion_constant, pixel, 0))
-            pixels[offset + 1] = _clamp01(_sample(rough_values, rough_constant, pixel, 0))
-            pixels[offset + 2] = _clamp01(_sample(metallic_values, metallic_constant, pixel, 0))
+            pixels[offset + 1] = remove_factor(_sample(rough_values, rough_constant, pixel, 0), roughness_factor)
+            pixels[offset + 2] = remove_factor(_sample(metallic_values, metallic_constant, pixel, 0), metallic_factor)
             pixels[offset + 3] = 1.0
         result.images["orm"] = _write_final_image(registry, f"{stem}_ORM", resolution, "Non-Color", pixels)
         _release_raw(registry, result, "Metallic", "Roughness", "Occlusion")
@@ -793,15 +801,30 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
 
     if "emissive" not in result.images and "Emissive" in result.raw:
         values, constant = _raw_values(result.raw["Emissive"])
-        maximum = 0.0
-        for pixel in range(count):
-            maximum = max(maximum, *(_sample(values, constant, pixel, component) for component in range(3)))
-        strength = maximum if maximum > 1.0 else 1.0
+        direct_emission = slot.source_analysis.strategy == "PBR" and (
+            slot.source_analysis.emission_color_factor != (1.0, 1.0, 1.0)
+            or abs(slot.source_analysis.emission_strength_factor - 1.0) > 1.0e-6
+        )
+        if direct_emission:
+            emission_factors = tuple(
+                value * slot.source_analysis.emission_strength_factor
+                for value in slot.source_analysis.emission_color_factor
+            )
+            strength = slot.source_analysis.emission_strength_factor
+        else:
+            maximum = 0.0
+            for pixel in range(count):
+                maximum = max(maximum, *(_sample(values, constant, pixel, component) for component in range(3)))
+            strength = maximum if maximum > 1.0 else 1.0
+            emission_factors = (strength, strength, strength)
         pixels = array("f", [0.0]) * (count * 4)
         for pixel in range(count):
             offset = pixel * 4
             for component in range(3):
-                pixels[offset + component] = _clamp01(_sample(values, constant, pixel, component) / strength)
+                pixels[offset + component] = remove_factor(
+                    _sample(values, constant, pixel, component),
+                    emission_factors[component],
+                )
             pixels[offset + 3] = 1.0
         result.emission_strength = strength
         result.images["emissive"] = _write_final_image(registry, f"{stem}_Emissive", resolution, "sRGB", pixels)
@@ -942,18 +965,37 @@ def rebuild_material(slot: MaterialSlotWork, registry: TempDataRegistry, object_
     tree.links.new(principled.outputs["BSDF"], output.inputs["Surface"])
 
     base = _image_node(tree, images["base_alpha"], "Base Color + Alpha")
-    tree.links.new(base.outputs["Color"], principled.inputs["Base Color"])
+    base_factor = slot.source_analysis.base_color_factor if slot.source_analysis.strategy == "PBR" else (1.0, 1.0, 1.0, 1.0)
+    base_color_output = base.outputs["Color"]
+    if any(abs(base_factor[index] - 1.0) > 1.0e-6 for index in range(3)):
+        multiply_color = tree.nodes.new("ShaderNodeMix")
+        multiply_color.data_type = "RGBA"
+        multiply_color.blend_type = "MULTIPLY"
+        next(socket for socket in multiply_color.inputs if socket.identifier == "Factor_Float").default_value = 1.0
+        color_a = next(socket for socket in multiply_color.inputs if socket.identifier == "A_Color")
+        color_b = next(socket for socket in multiply_color.inputs if socket.identifier == "B_Color")
+        color_b.default_value = (*base_factor[:3], 1.0)
+        tree.links.new(base_color_output, color_a)
+        base_color_output = next(socket for socket in multiply_color.outputs if socket.identifier == "Result_Color")
+    tree.links.new(base_color_output, principled.inputs["Base Color"])
     alpha_mode = slot.result.alpha_mode or slot.source_analysis.alpha.mode
     alpha_cutoff = slot.result.alpha_cutoff
+    alpha_output = base.outputs["Alpha"]
+    if abs(base_factor[3] - 1.0) > 1.0e-6:
+        multiply_alpha = tree.nodes.new("ShaderNodeMath")
+        multiply_alpha.operation = "MULTIPLY"
+        multiply_alpha.inputs[1].default_value = base_factor[3]
+        tree.links.new(alpha_output, multiply_alpha.inputs[0])
+        alpha_output = multiply_alpha.outputs[0]
     if alpha_mode == "CLIP" or alpha_mode == "MASK":
         clip = tree.nodes.new("ShaderNodeMath")
         clip.operation = "GREATER_THAN"
         clip.inputs[1].default_value = alpha_cutoff
-        tree.links.new(base.outputs["Alpha"], clip.inputs[0])
+        tree.links.new(alpha_output, clip.inputs[0])
         tree.links.new(clip.outputs[0], principled.inputs["Alpha"])
         material.surface_render_method = "DITHERED"
     elif alpha_mode == "BLEND":
-        tree.links.new(base.outputs["Alpha"], principled.inputs["Alpha"])
+        tree.links.new(alpha_output, principled.inputs["Alpha"])
         material.surface_render_method = "BLENDED"
     else:
         principled.inputs["Alpha"].default_value = 1.0
@@ -961,8 +1003,24 @@ def rebuild_material(slot: MaterialSlotWork, registry: TempDataRegistry, object_
     orm = _image_node(tree, images["orm"], "ORM")
     separate = tree.nodes.new("ShaderNodeSeparateColor")
     tree.links.new(orm.outputs["Color"], separate.inputs["Color"])
-    tree.links.new(separate.outputs["Green"], principled.inputs["Roughness"])
-    tree.links.new(separate.outputs["Blue"], principled.inputs["Metallic"])
+    roughness_output = separate.outputs["Green"]
+    roughness_factor = slot.source_analysis.roughness_factor if slot.source_analysis.strategy == "PBR" else 1.0
+    if abs(roughness_factor - 1.0) > 1.0e-6:
+        multiply_roughness = tree.nodes.new("ShaderNodeMath")
+        multiply_roughness.operation = "MULTIPLY"
+        multiply_roughness.inputs[1].default_value = roughness_factor
+        tree.links.new(roughness_output, multiply_roughness.inputs[0])
+        roughness_output = multiply_roughness.outputs[0]
+    metallic_output = separate.outputs["Blue"]
+    metallic_factor = slot.source_analysis.metallic_factor if slot.source_analysis.strategy == "PBR" else 1.0
+    if abs(metallic_factor - 1.0) > 1.0e-6:
+        multiply_metallic = tree.nodes.new("ShaderNodeMath")
+        multiply_metallic.operation = "MULTIPLY"
+        multiply_metallic.inputs[1].default_value = metallic_factor
+        tree.links.new(metallic_output, multiply_metallic.inputs[0])
+        metallic_output = multiply_metallic.outputs[0]
+    tree.links.new(roughness_output, principled.inputs["Roughness"])
+    tree.links.new(metallic_output, principled.inputs["Metallic"])
 
     settings = None
     if "occlusion" in extensions or "volume" in extensions:
@@ -978,7 +1036,19 @@ def rebuild_material(slot: MaterialSlotWork, registry: TempDataRegistry, object_
     tree.links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
 
     emissive = _image_node(tree, images["emissive"], "Emissive")
-    tree.links.new(emissive.outputs["Color"], principled.inputs["Emission Color"])
+    emissive_output = emissive.outputs["Color"]
+    emission_factor = slot.source_analysis.emission_color_factor if slot.source_analysis.strategy == "PBR" else (1.0, 1.0, 1.0)
+    if any(abs(value - 1.0) > 1.0e-6 for value in emission_factor):
+        multiply_emission = tree.nodes.new("ShaderNodeMix")
+        multiply_emission.data_type = "RGBA"
+        multiply_emission.blend_type = "MULTIPLY"
+        next(socket for socket in multiply_emission.inputs if socket.identifier == "Factor_Float").default_value = 1.0
+        emission_a = next(socket for socket in multiply_emission.inputs if socket.identifier == "A_Color")
+        emission_b = next(socket for socket in multiply_emission.inputs if socket.identifier == "B_Color")
+        emission_b.default_value = (*emission_factor, 1.0)
+        tree.links.new(emissive_output, emission_a)
+        emissive_output = next(socket for socket in multiply_emission.outputs if socket.identifier == "Result_Color")
+    tree.links.new(emissive_output, principled.inputs["Emission Color"])
     principled.inputs["Emission Strength"].default_value = slot.result.emission_strength
 
     if "transmission" in extensions:

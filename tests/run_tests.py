@@ -112,6 +112,38 @@ def modifier_signature(obj: bpy.types.Object) -> tuple:
     return tuple((modifier.name, modifier.type, bool(modifier.show_viewport), bool(modifier.show_render)) for modifier in obj.modifiers)
 
 
+def matrix_signature(matrix) -> tuple[float, ...]:
+    return tuple(round(float(matrix[row][column]), 5) for row in range(4) for column in range(4))
+
+
+def material_texture_contracts(material: dict) -> set[tuple]:
+    infos = []
+    pbr = material.get("pbrMetallicRoughness", {})
+    for name in ("baseColorTexture", "metallicRoughnessTexture"):
+        if isinstance(pbr.get(name), dict):
+            infos.append(pbr[name])
+    for name in ("normalTexture", "occlusionTexture", "emissiveTexture"):
+        if isinstance(material.get(name), dict):
+            infos.append(material[name])
+    for extension in material.get("extensions", {}).values():
+        if not isinstance(extension, dict):
+            continue
+        infos.extend(info for name, info in extension.items() if name.endswith("Texture") and isinstance(info, dict))
+
+    contracts = set()
+    for info in infos:
+        transform = info.get("extensions", {}).get("KHR_texture_transform", {})
+        contracts.add(
+            (
+                int(transform.get("texCoord", info.get("texCoord", 0))),
+                tuple(float(value) for value in transform.get("offset", [0.0, 0.0])),
+                float(transform.get("rotation", 0.0)),
+                tuple(float(value) for value in transform.get("scale", [1.0, 1.0])),
+            )
+        )
+    return contracts
+
+
 def make_comprehensive_scene() -> tuple[bpy.types.Object, bpy.types.Object, bpy.types.Material]:
     material, principled, _ = make_principled_material("ComprehensiveMaterial")
     tree = material.node_tree
@@ -242,6 +274,11 @@ def run() -> TestResults:
     extensions = materials[0].get("extensions", {}) if materials else {}
     results.check("4. Noise TextureとColorRampをBase Colorへベイクできる", "baseColorTexture" in pbr)
     results.check("5. Math NodeをRoughnessへベイクできる", "metallicRoughnessTexture" in pbr)
+    results.check(
+        "同一Material内の全texture slotが単一Bake UV契約を使う",
+        bool(materials) and material_texture_contracts(materials[0]) == {(0, (0.0, 0.0), 0.0, (1.0, 1.0))},
+        str(material_texture_contracts(materials[0])) if materials else "Materialがありません",
+    )
 
     if parsed and materials:
         orm_image_index = texture_image_index(document, pbr["metallicRoughnessTexture"]["index"])
@@ -249,7 +286,8 @@ def run() -> TestResults:
         orm_values = image_pixels(orm_image)
         valid_metallic = [orm_values[index + 2] for index in range(0, len(orm_values), 4) if orm_values[index + 2] > 0.5]
         valid_roughness = [orm_values[index + 1] for index in range(0, len(orm_values), 4) if orm_values[index + 2] > 0.5]
-        results.check("6. MetallicをBチャンネルへ格納する", bool(valid_metallic) and abs(sum(valid_metallic) / len(valid_metallic) - 0.75) < 0.03)
+        metallic_factor = float(pbr.get("metallicFactor", 1.0))
+        results.check("6. Metallicのtexture×factorを保持する", bool(valid_metallic) and abs((sum(valid_metallic) / len(valid_metallic)) * metallic_factor - 0.75) < 0.03)
         results.check("7. RoughnessをGチャンネルへ格納する", bool(valid_roughness) and max(valid_roughness) - min(valid_roughness) > 0.05)
         bpy.data.images.remove(orm_image)
 
@@ -337,6 +375,11 @@ def run() -> TestResults:
 
     blend_material, blend_principled, _ = make_principled_material("BlendAccepted")
     blend_material.surface_render_method = "BLENDED"
+    blend_principled.inputs["Base Color"].default_value = (0.25, 0.5, 0.75, 1.0)
+    blend_principled.inputs["Metallic"].default_value = 0.3
+    blend_principled.inputs["Roughness"].default_value = 0.65
+    blend_principled.inputs["Emission Color"].default_value = (0.2, 0.4, 0.1, 1.0)
+    blend_principled.inputs["Emission Strength"].default_value = 5.0
     blend_principled.inputs["Alpha"].default_value = 0.4
     blend_obj = make_cube("BlendObject", blend_material, (18.0, 0.0, 0.0))
     select_only(blend_obj)
@@ -346,6 +389,23 @@ def run() -> TestResults:
     blend_parsed = parse_glb(temp_root / "blend.glb") if (temp_root / "blend.glb").is_file() else None
     blend_mode = blend_parsed.document["materials"][0].get("alphaMode") if blend_parsed else None
     results.check("定数Alpha Blendを書き出す", not blend_errors and blend_status == JobStatus.SUCCEEDED and blend_mode == "BLEND", "; ".join(str(error) for error in blend_job.errors))
+    blend_pbr = blend_parsed.document["materials"][0].get("pbrMetallicRoughness", {}) if blend_parsed else {}
+    blend_factor = blend_pbr.get("baseColorFactor", [1.0, 1.0, 1.0, 1.0])
+    results.check(
+        "定数Core PBR factorをtextureと分離して保持する",
+        all(abs(float(actual) - expected) < 1.0e-4 for actual, expected in zip(blend_factor, (0.25, 0.5, 0.75, 0.4)))
+        and abs(float(blend_pbr.get("metallicFactor", 1.0)) - 0.3) < 1.0e-4
+        and abs(float(blend_pbr.get("roughnessFactor", 1.0)) - 0.65) < 1.0e-4,
+        str(blend_pbr),
+    )
+    blend_material_json = blend_parsed.document["materials"][0] if blend_parsed else {}
+    blend_emission = blend_material_json.get("emissiveFactor", [0.0, 0.0, 0.0])
+    blend_strength = blend_material_json.get("extensions", {}).get("KHR_materials_emissive_strength", {}).get("emissiveStrength", 1.0)
+    results.check(
+        "Emissive factorとstrengthの積を保持する",
+        all(abs(float(factor) * float(blend_strength) - expected) < 1.0e-4 for factor, expected in zip(blend_emission, (1.0, 2.0, 0.5))),
+        str(blend_material_json),
+    )
 
     continuous_material, continuous_principled, _ = make_principled_material("ContinuousAlpha")
     continuous_material.surface_render_method = "DITHERED"
@@ -440,6 +500,67 @@ def run() -> TestResults:
     unlit_extensions = unlit_parsed.document["materials"][0].get("extensions", {}) if unlit_parsed else {}
     results.check("Emission材質をKHR_materials_unlitで書き出す", unlit_status == JobStatus.SUCCEEDED and "KHR_materials_unlit" in unlit_extensions, "; ".join(str(error) for error in unlit_job.errors))
 
+    hierarchy_material, hierarchy_principled, _ = make_principled_material("HierarchyMaterial")
+    hierarchy_principled.inputs["Base Color"].default_value = (0.25, 0.5, 0.75, 1.0)
+    hierarchy_root = bpy.data.objects.new("HierarchyRoot", None)
+    bpy.context.scene.collection.objects.link(hierarchy_root)
+    hierarchy_root.location = (2.0, -1.0, 3.0)
+    hierarchy_root.rotation_euler = (0.2, -0.1, 0.35)
+    # glTF TRSで厳密に表現できる階層を構成する。非一様scale親と回転子が
+    # 作るshearは単一TRSへ分解できないため、この受入fixtureには含めない。
+    hierarchy_root.scale = (1.2, 1.2, 1.2)
+    hierarchy_parent = make_cube("HierarchyParent", hierarchy_material)
+    hierarchy_parent.parent = hierarchy_root
+    hierarchy_parent.location = (1.0, 2.0, 0.5)
+    hierarchy_parent.rotation_euler = (-0.15, 0.25, 0.05)
+    hierarchy_child = make_cube("HierarchyChild", hierarchy_material)
+    hierarchy_child.parent = hierarchy_parent
+    hierarchy_child.location = (-0.5, 0.75, 1.25)
+    hierarchy_child.rotation_euler = (0.1, 0.2, -0.3)
+    hierarchy_child.scale = (0.5, 1.25, 0.75)
+    bpy.context.view_layer.update()
+    hierarchy_world = {
+        "HierarchyParent__BAKED": matrix_signature(hierarchy_parent.matrix_world),
+        "HierarchyChild__BAKED": matrix_signature(hierarchy_child.matrix_world),
+    }
+    hierarchy_output = temp_root / "hierarchy.glb"
+    select_only(hierarchy_parent, hierarchy_child)
+    hierarchy_job = BakeJob(bpy.context, BakeJobConfig(hierarchy_output, 512))
+    hierarchy_status = hierarchy_job.run_to_completion()
+    hierarchy_parsed = parse_glb(hierarchy_output) if hierarchy_output.is_file() else None
+    hierarchy_document = hierarchy_parsed.document if hierarchy_parsed else {}
+    hierarchy_nodes = hierarchy_document.get("nodes", [])
+    hierarchy_indices = {node.get("name", ""): index for index, node in enumerate(hierarchy_nodes)}
+    root_index = hierarchy_indices.get("HierarchyRoot__BAKED_HIERARCHY")
+    parent_index = hierarchy_indices.get("HierarchyParent__BAKED")
+    child_index = hierarchy_indices.get("HierarchyChild__BAKED")
+    hierarchy_links_ok = (
+        root_index is not None
+        and parent_index in hierarchy_nodes[root_index].get("children", [])
+        and child_index in hierarchy_nodes[parent_index].get("children", [])
+        and root_index in hierarchy_document.get("scenes", [{}])[0].get("nodes", [])
+    )
+    results.check(
+        "glTF NodeのTRSと選択Mesh/Empty祖先の階層を保持する",
+        hierarchy_status == JobStatus.SUCCEEDED and hierarchy_links_ok,
+        f"nodes={hierarchy_indices}; errors={'; '.join(str(error) for error in hierarchy_job.errors)}",
+    )
+    if hierarchy_parsed:
+        before_import = {obj.as_pointer() for obj in bpy.data.objects}
+        bpy.ops.import_scene.gltf(filepath=str(hierarchy_output))
+        imported_hierarchy = {
+            obj.name: obj
+            for obj in bpy.data.objects
+            if obj.as_pointer() not in before_import and obj.name in hierarchy_world
+        }
+        roundtrip_ok = set(imported_hierarchy) == set(hierarchy_world) and all(
+            matrix_signature(imported_hierarchy[name].matrix_world) == expected
+            for name, expected in hierarchy_world.items()
+        )
+        results.check("GLB再import後もMeshのworld transformを保持する", roundtrip_ok, str({name: matrix_signature(obj.matrix_world) for name, obj in imported_hierarchy.items()}))
+    else:
+        results.check("GLB再import後もMeshのworld transformを保持する", False, "階層GLBがありません")
+
     results.check("拡張子なし保存名へ.glbを追加する", ensure_glb_extension("C:/tmp/model") == "C:/tmp/model.glb" and ensure_glb_extension("C:/tmp/model.glb") == "C:/tmp/model.glb")
     results.check("保存済みBlend名を初期GLB名にする", default_export_filepath("C:/scene/example.blend", "Cube", "", "C:/tmp").replace("\\", "/") == "C:/scene/example.glb")
     results.check("未保存時はActive Mesh名を初期GLB名にする", default_export_filepath("", "Active Cube", "", "C:/tmp").replace("\\", "/").endswith("/Active_Cube.glb"))
@@ -500,7 +621,7 @@ def run() -> TestResults:
     )
     public_ok = True
     for path in REPO_ROOT.rglob("*"):
-        if not path.is_file() or ".git" in path.parts or "dist" in path.parts or path.suffix.lower() in {".pyc", ".zip"}:
+        if not path.is_file() or any(part in {".git", "dist", "test-output", "__pycache__"} for part in path.parts) or path.suffix.lower() in {".pyc", ".zip"}:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         public_ok = public_ok and not any(word in text for word in forbidden)

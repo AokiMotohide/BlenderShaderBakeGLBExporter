@@ -31,10 +31,13 @@ Shader Bake GLB Exporterは、選択したMeshの接続済みシェーダーをP
 
 - 標準GLB 2.0
 - 選択Meshだけを出力
+- 選択Mesh間の親子関係と、配置に必要なEmpty祖先をglTF Node階層として保持
 - Base Color + Alpha: RGBA PNG、sRGB
 - ORM: RGB PNG、Linear、R=Occlusion、G=Roughness、B=Metallic
 - Normal: tangent-space RGB PNG、Linear
 - Emissive: RGB PNG、sRGB
+- 全texture slotを単一のBake UVへ統一し、`TEXCOORD_0`で出力
+- 定数Base Color、Alpha、Metallic、Roughness、Emissive、IORを標準glTF factorとして保持
 - 画像: 8bit PNG
 - 対応する場合はTransmission、IOR、Specular、Clearcoat、Sheen、Anisotropy、Volume、Emissive Strength、Unlit用KHR拡張を出力
 
@@ -72,6 +75,8 @@ glTFにはAlpha Hashedと同一のモードがないため、連続Alphaとし�
 - 解像度は全Objectと全Material Slotへ共通で適用します。512、1024、2048から選択します。
 
 元Object、Mesh、Material、Node、Image、UV、Modifier、Scene設定、Render設定は直接変更しません。一時データは成功、失敗、キャンセルの全経路で削除します。GLBは一時ファイルへ出力し、構造検証に成功した場合だけ最終パスへ原子的に置換します。
+
+出力検証ではNodeのTRS/matrix排他、階層参照、非循環性、Mesh/Material参照、全texture slotの実効UV set/transform一致、主要factorの値域を確認します。Bake後は全slotが同じ`TEXCOORD_0`を使うため、元材質に異なるUV setやMappingがあっても`KHR_texture_transform`へ依存しません。
 
 ## テスト
 

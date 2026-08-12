@@ -14,7 +14,10 @@
 ## 主な機能
 
 - 選択したMeshだけをGLBへ出力
+- 選択Mesh間の階層と配置に必要なEmpty祖先をglTF Nodeとして保持
 - Base Color + Alpha、ORM、Normal、Emissiveを8bit PNGへベイク
+- 全texture slotを単一Bake UVと`TEXCOORD_0`へ統一
+- 定数Base Color、Alpha、Metallic、Roughness、Emissive、IORを標準factorとして保持
 - 連続Alpha、Alpha Blend、Alpha Hashed相当を`alphaMode: BLEND`で出力
 - Alpha Clipを`alphaMode: MASK`と`alphaCutoff`で保持
 - Transmission、IOR、Specular、Clearcoat、Sheen、Anisotropy、Volume、Emissive Strength、Unlit用KHR拡張を出力
@@ -41,10 +44,11 @@ Blender 5.1.1以外での動作は保証していません。詳細は[日本語
 
 - Blender 5.1.1 `--background --factory-startup --disable-autoexec`
 - 完全変換、KHR材質、連続Alpha、Alpha Clip、任意Shader近似、Materialフォールバック、再import、原子的置換を含む自動テスト
+- Node階層、world transform、単一UV契約、material factor、実シーンcold/hot再読込を含む互換性検証
 - Blender Extension検証
 - 配布ZIP内容検証
 
 ## 配布ZIPの検証情報
 
-- ファイルサイズ: 27,845 bytes
-- SHA-256: `1C1092EF4181F01A558D267EC029D4FDC734B708E2ACF268C3C5CE3B5AF0D238`
+- ファイルサイズ: 31,501 bytes
+- SHA-256: `C9B8E4A1AB4DFD120471CA199C83756DDDC8A6E6C8FF52BDB6EB8E8DD7B3A322`
