@@ -11,10 +11,12 @@ Shader Bake GLB Exporterは、選択したMeshオブジェクトの接続済みP
 
 ## インストール
 
-1. `tools/package.ps1`を実行して`dist/shader_bake_glb_exporter-1.0.0.zip`を生成します。
+1. [GitHub Releases](https://github.com/AokiMotohide/BlenderShaderBakeGLBExporter/releases/latest)から`shader_bake_glb_exporter-1.0.0.zip`をダウンロードします。ZIPは展開しません。
 2. Blenderの`Edit > Preferences > Extensions`を開きます。
-3. メニューから`Install from Disk`を選び、生成したZIPを指定します。
+3. 右上のメニューから`Install from Disk`を選び、ダウンロードしたZIPを指定します。
 4. 「Shader Bake GLB Exporter」を有効にします。
+
+詳しい操作、設定、対応範囲、エラー対処は[日本語マニュアル](docs/USER_MANUAL.ja.md)を参照してください。
 
 ## 使用方法
 
