@@ -56,6 +56,7 @@ class MaterialValidationError(Exception):
 
 
 def _socket(node: bpy.types.Node, name: str) -> bpy.types.NodeSocket:
+    # Blenderのバージョン差や壊れたNode Treeを、後段の属性エラーではなく診断へ変換する。
     socket = node.inputs.get(name)
     if socket is None:
         raise ValueError(f"Principled BSDFに{name}入力がありません")
@@ -67,6 +68,7 @@ def _constant(socket: bpy.types.NodeSocket) -> float:
 
 
 def _linked_source(socket: bpy.types.NodeSocket) -> bpy.types.NodeSocket | None:
+    # 複数linkがあり得るRNAでも、材質解析は有効な先頭linkを評価入口として扱う。
     return socket.links[0].from_socket if socket.is_linked and socket.links else None
 
 
@@ -84,6 +86,7 @@ def _as_tuple(value: object) -> tuple[float, ...]:
 
 
 def _socket_active(socket: bpy.types.NodeSocket, neutral: float | tuple[float, ...]) -> bool:
+    # 接続済みは値を静的に判定できないため常に有効とみなす。
     if socket.is_linked:
         return True
     actual = _as_tuple(socket.default_value)
@@ -117,12 +120,14 @@ def _reachable_nodes(principled: bpy.types.Node) -> list[tuple[bpy.types.Node, s
     visited: set[tuple[int, str, tuple[int, ...]]] = set()
 
     def matching_socket(sockets, template: bpy.types.NodeSocket, fallback_index: int):
+        # Group境界ではidentifier優先で対応付け、名称変更時のみ配列順へ後退する。
         for socket in sockets:
             if socket.identifier == template.identifier or socket.name == template.name:
                 return socket
         return sockets[fallback_index] if fallback_index < len(sockets) else None
 
     def walk_input(input_socket: bpy.types.NodeSocket, group_stack: tuple[bpy.types.Node, ...]) -> None:
+        # Group Input/Outputをまたいで上流へ戻り、視線依存Nodeの見落としを防ぐ。
         if not input_socket.is_linked:
             return
         for link in input_socket.links:
@@ -159,6 +164,7 @@ def _reachable_nodes(principled: bpy.types.Node) -> list[tuple[bpy.types.Node, s
 
 
 def _gltf_socket(material: bpy.types.Material, name: str) -> bpy.types.NodeSocket | None:
+    # glTF Material Output Groupは標準exporter向け補助入力で、通常のPrincipled入力とは別に扱う。
     if material.node_tree is None:
         return None
     for node in material.node_tree.nodes:
@@ -169,6 +175,7 @@ def _gltf_socket(material: bpy.types.Material, name: str) -> bpy.types.NodeSocke
 
 
 def _alpha_contract(principled: bpy.types.Node) -> AlphaContract:
+    # Blender Node Treeの代表的な閾値形を、GLBのOPAQUE/MASK/BLEND契約へ落とし込む。
     alpha = _socket(principled, "Alpha")
     if not alpha.is_linked:
         value = _finite_or(_constant(alpha), 1.0)
@@ -176,6 +183,7 @@ def _alpha_contract(principled: bpy.types.Node) -> AlphaContract:
             return AlphaContract("OPAQUE", 0.5, None)
         return AlphaContract("BLEND", 0.5, alpha)
 
+    # ROUND、比較Node、反転比較はMASKに再現できる。その他の動的値はBLENDとして保持する。
     source = alpha.links[0].from_node
     if source.bl_idname == "ShaderNodeMath" and source.operation == "ROUND":
         return AlphaContract("CLIP", 0.5, _linked_source(source.inputs[0]) or source.inputs[0])
@@ -201,6 +209,7 @@ def _alpha_contract(principled: bpy.types.Node) -> AlphaContract:
 
 
 def _fallback_analysis(material: bpy.types.Material, reasons: Iterable[str], output: bpy.types.Node | None = None) -> MaterialAnalysis:
+    # 変換を中止せず、viewport色を使う最小限の外観近似へ明示的に切り替える。
     color = tuple(float(v) for v in material.diffuse_color)
     alpha = AlphaContract("OPAQUE" if len(color) < 4 or color[3] >= 1.0 - EPSILON else "BLEND", 0.5, None)
     return MaterialAnalysis(material, output, None, alpha, 1.5, "FALLBACK", tuple(dict.fromkeys(reasons)), frozenset())
@@ -214,6 +223,7 @@ def analyze_material(material: bpy.types.Material, object_name: str = "") -> Mat
     if not material.use_nodes or material.node_tree is None:
         return _fallback_analysis(material, ("Node未使用Materialをviewport色で近似します",))
 
+    # 1. 実際に評価されるSurface入口を1個だけ特定する。
     outputs = [node for node in material.node_tree.nodes if node.bl_idname == "ShaderNodeOutputMaterial" and node.is_active_output]
     if len(outputs) != 1:
         return _fallback_analysis(material, ("Active Material Outputを特定できないため近似します",))
@@ -236,6 +246,7 @@ def analyze_material(material: bpy.types.Material, object_name: str = "") -> Mat
     if principled.bl_idname != "ShaderNodeBsdfPrincipled":
         return _fallback_analysis(material, (f"{principled.bl_label or principled.name}をPBRへ近似します",), output)
 
+    # 2. GLB Core PBRへ完全変換できない入力を列挙し、必要なら外観近似へ切り替える。
     reasons: list[str] = []
     unsupported = (
         ("Weight", 1.0),
@@ -258,6 +269,7 @@ def analyze_material(material: bpy.types.Material, object_name: str = "") -> Mat
     if output.inputs.get("Displacement") and output.inputs["Displacement"].is_linked:
         reasons.append("Shader DisplacementはGLB材質へ保持できないため省略します")
 
+    # 視点やレンダー条件に依存するNodeは、固定テクスチャへ焼くことを診断として残す。
     risky = {
         "ShaderNodeCameraData": "Camera Data",
         "ShaderNodeLightPath": "Light Path",
@@ -274,6 +286,7 @@ def analyze_material(material: bpy.types.Material, object_name: str = "") -> Mat
     if any(node.bl_idname == "ShaderNodeScript" for node in _all_nested_nodes(material.node_tree)):
         reasons.append("OSL Scriptは評価失敗時に既定値へ置換します")
 
+    # 3. PBRとして保持可能な係数と拡張機能を抽出する。
     ior_socket = _socket(principled, "IOR")
     if ior_socket.is_linked:
         reasons.append("Procedural IORはテクスチャ化できないため近似します")
@@ -284,6 +297,7 @@ def analyze_material(material: bpy.types.Material, object_name: str = "") -> Mat
             ior = 1.5
             reasons.append("IORを1.5へ補正します")
 
+    # 中立値と異なる入力だけを拡張として出力し、不要なGLB拡張を増やさない。
     extensions: set[str] = set()
     if _socket_active(_socket(principled, "Transmission Weight"), 0.0):
         extensions.add("transmission")
@@ -306,6 +320,7 @@ def analyze_material(material: bpy.types.Material, object_name: str = "") -> Mat
     elif volume_input and volume_input.is_linked:
         reasons.append("VolumeをCore PBR外観へ近似し、体積効果は省略します")
 
+    # 4. 定数factorはテクスチャと二重に焼かず、再構築時に係数として掛け戻す。
     strategy = "FALLBACK" if reasons else "PBR"
     base_color_socket = _socket(principled, "Base Color")
     if base_color_socket.is_linked:

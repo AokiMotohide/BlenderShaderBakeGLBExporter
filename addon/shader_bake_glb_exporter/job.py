@@ -48,6 +48,8 @@ class BakeJobConfig:
 
 @dataclass(frozen=True)
 class JobStep:
+    """Modal timer 1回で実行する最小工程。UIへ工程名と対象を渡す。"""
+
     phase: str
     object_name: str
     material_name: str
@@ -66,6 +68,8 @@ class StaticObjectInstance:
 
 @dataclass
 class ContextSnapshot:
+    """Jobが一時的に変更するBlender状態を、終了時に戻すための退避値。"""
+
     scene: bpy.types.Scene
     window_scene: bpy.types.Scene | None
     view_layer: bpy.types.ViewLayer
@@ -81,10 +85,12 @@ class ContextSnapshot:
 
 
 def selected_mesh_objects(context: bpy.types.Context) -> list[bpy.types.Object]:
+    # 非Meshを早い段階で除外し、後続のMesh固有処理へ渡さない。
     return [obj for obj in context.selected_objects if obj.type == "MESH"]
 
 
 def detected_material_count(objects: Iterable[bpy.types.Object]) -> int:
+    # 実際にFaceから参照されるMaterialだけを数え、未使用slotを表示に含めない。
     materials = set()
     for obj in objects:
         for index in used_material_indices(obj.data):
@@ -100,6 +106,7 @@ def preflight(
 ) -> tuple[list[bpy.types.Object], list[MaterialValidationError], int]:
     """一時DataBlockを作る前に全対象を検証する。"""
 
+    # 一時DataBlock作成前に、入力として回復不能な条件をまとめて収集する。
     errors: list[MaterialValidationError] = []
     candidates = list(objects) if objects is not None else selected_mesh_objects(context)
     if not candidates:
@@ -114,6 +121,7 @@ def preflight(
     if config.resolution not in {512, 1024, 2048}:
         errors.append(MaterialValidationError("<設定>", "<なし>", "解像度は512、1024、2048だけを指定できます"))
 
+    # UI進捗の見積もり用に、選択対象の実使用Material slotだけを数える。
     material_usages = 0
     for obj in selected:
         for slot_index in used_material_indices(obj.data):
@@ -130,11 +138,13 @@ class BakeJob:
         config: BakeJobConfig,
         objects: list[bpy.types.Object] | None = None,
     ) -> None:
+        # Jobは開始から終了までの一時DataBlock、進捗、診断を一元所有する。
         self.context = context
         self.config = config
         candidates = list(objects) if objects is not None else selected_mesh_objects(context)
         self.objects, self.errors, self.material_usages = preflight(context, config, objects)
         self.warnings: list[MaterialValidationError] = []
+        # FaceなしMeshは致命エラーにせず、明示的な警告を残して対象から外す。
         for obj in candidates:
             if not obj.data.polygons:
                 self._warn(obj.name, "<なし>", "Faceがないため書き出し対象から除外しました")
@@ -157,6 +167,7 @@ class BakeJob:
         self._snapshot: ContextSnapshot | None = None
 
     def _warn(self, object_name: str, material_name: str, reason: str) -> None:
+        # 同一警告を重複表示しない。複数工程から同じ原因を検出する場合がある。
         warning = MaterialValidationError(object_name, material_name, reason)
         if warning not in self.warnings:
             self.warnings.append(warning)
@@ -168,9 +179,11 @@ class BakeJob:
         return min(1.0, self.completed_units / self.total_units)
 
     def request_cancel(self) -> None:
+        # 実行中のBlender Operatorを途中で壊さないため、停止要求だけを記録する。
         self.cancel_requested = True
 
     def _capture_context(self) -> ContextSnapshot:
+        # Scene、選択、Object Mode、レンダー設定はJobの副作用なので必ず退避する。
         return ContextSnapshot(
             scene=self.context.scene,
             window_scene=self.context.window.scene if self.context.window else None,
@@ -187,6 +200,7 @@ class BakeJob:
         )
 
     def _ensure_original_object_mode(self) -> None:
+        # UV展開・ベイクのoverrideはObject Modeを前提にする。
         active = self.context.view_layer.objects.active
         if active is not None and active.mode != "OBJECT":
             try:
@@ -197,6 +211,7 @@ class BakeJob:
     def _capture_static_instances(self) -> list[bpy.types.Object]:
         """選択Meshが生成したinstanceを元SceneのdepsgraphからJob所有情報へ固定する。"""
 
+        # depsgraph上のinstanceは元Sceneを掃除する前に、transformと親を値として固定する。
         selected_pointers = {obj.as_pointer() for obj in self.objects}
         source_objects: dict[int, bpy.types.Object] = {}
         depsgraph = self.context.evaluated_depsgraph_get()
@@ -219,6 +234,7 @@ class BakeJob:
             ):
                 self._warn(parent.name, source.name, "非有限transformを持つ静的instanceを除外しました")
                 continue
+            # persistent_idはinstanceの名前重複と無関係に、depsgraph上の生成元を識別する。
             persistent_id = tuple(
                 int(value)
                 for value in instance.persistent_id
@@ -240,6 +256,7 @@ class BakeJob:
         if self.errors:
             self.status = JobStatus.FAILED
             return
+        # 以降の失敗経路でも元のUI・Render状態へ戻すため、最初に状態を退避する。
         self._snapshot = self._capture_context()
         try:
             self._ensure_original_object_mode()
@@ -247,6 +264,7 @@ class BakeJob:
             self._instance_only_source_pointers = {
                 source.as_pointer() for source in instance_only_sources
             }
+            # 元Sceneに一時Collectionを置く設計により、別SceneのDepsgraph不整合を避ける。
             self.scene, self.collection = create_job_scene(self.context.scene, self.registry)
             for original in [*self.objects, *instance_only_sources]:
                 try:
@@ -258,6 +276,7 @@ class BakeJob:
             if not self.work_objects:
                 raise BakeFailure("書き出せるMeshがありません")
             self.material_usages = sum(len(work.slots) for work in self.work_objects)
+            # すべての工程を先に列挙して、Modal UIが一貫した進捗を表示できるようにする。
             self._build_steps()
             self.total_units = len(self._steps)
             self.status = JobStatus.RUNNING
@@ -266,16 +285,19 @@ class BakeJob:
 
     def _build_steps(self) -> None:
         assert self.scene is not None
+        # 1. 全ObjectのBake UVを準備する。材質処理より前にUV契約を確定する。
         for work in self.work_objects:
             self._steps.append(
                 JobStep("UV生成", work.original.name, "", lambda work=work: unwrap_work_object(self.context, self.scene, work))
             )
+        # 2. Material slotごとに必要なChannelだけを評価・ベイク・結合する。
         for work in self.work_objects:
             for slot in work.slots:
                 for channel in channels_for_analysis(slot.source_analysis):
                     stem = f"{work.original.name}_slot_{slot.slot_index}"
 
                     def channel_action(work=work, slot=slot, channel=channel, stem=stem):
+                        # Raw Channelは必要な最終テクスチャにまとまった時点で解放される。
                         bake_channel(self.context, self.scene, work, slot, channel, self.config.resolution, self.registry, self._warn)
                         combine_ready_images(slot, self.config.resolution, self.registry, stem)
 
@@ -289,7 +311,9 @@ class BakeJob:
                     )
                 )
 
+        # 3. 完成した作業コピーを元Scene内の専用Collectionへ並べ、標準exporterを呼ぶ。
         def export_action() -> None:
+            # GLBではBake UVだけを残し、ベイク済みMaterialへ差し替える。
             for work in self.work_objects:
                 finalize_work_object(work)
             assert self._snapshot is not None
@@ -304,6 +328,7 @@ class BakeJob:
             export_work_objects: list[WorkObject] = []
             export_nodes: dict[int, bpy.types.Object] = {}
             export_sources: dict[int, WorkObject] = {}
+            # MeshとMaterialはexporter専用にもう一度複製し、作業SceneのDataBlockと分離する。
             for work in self.work_objects:
                 export_mesh = self.registry.track(work.object.data.copy())
                 export_object = self.registry.track(
@@ -340,6 +365,7 @@ class BakeJob:
                     parent = parent.parent
                 return depth
 
+            # 親を先に作成してから接続できるよう、階層の浅い順に並べる。
             ancestors.sort(key=hierarchy_depth)
             depsgraph = self.context.evaluated_depsgraph_get()
             for original in ancestors:
@@ -351,6 +377,7 @@ class BakeJob:
                 export_collection.objects.link(proxy)
                 export_nodes[original.as_pointer()] = proxy
 
+            # 親付け後もworld transformを復元し、元階層と同じ見た目を維持する。
             for work in export_work_objects:
                 original = work.original
                 if original.as_pointer() in self._instance_only_source_pointers:
@@ -376,6 +403,7 @@ class BakeJob:
                 proxy.parent = export_parent
                 proxy.matrix_world = world
 
+            # depsgraph instanceは同じ完成Meshを共有しつつ、個別のworld transformを持たせる。
             hierarchy_objects = list(export_nodes.values())
             for index, instance in enumerate(self.static_instances):
                 source_work = export_sources.get(instance.source.as_pointer())
@@ -408,6 +436,7 @@ class BakeJob:
                 self.config.output_path,
             )
 
+        # 4. 構造検証が成功した場合だけ、一時GLBを最終パスへ置換する。
         def validate_action() -> None:
             if self.pending_glb is None:
                 raise BakeFailure("検証対象の一時GLBがありません")
@@ -418,10 +447,12 @@ class BakeJob:
         self._steps.append(JobStep("検証", "", "", validate_action))
 
     def advance(self) -> JobStatus:
+        # UI timerから繰り返し呼ばれる。1回の呼び出しで最大1工程だけを実行する。
         if self.status == JobStatus.READY:
             self.start()
         if self.status != JobStatus.RUNNING:
             return self.status
+        # 工程の境界でのみキャンセルを反映し、実行中Operatorの中断による残骸を防ぐ。
         if self.cancel_requested:
             self._cancel()
             return self.status
@@ -429,6 +460,7 @@ class BakeJob:
             self._succeed()
             return self.status
 
+        # 表示状態を先に更新して、例外時にも失敗した工程をUIへ残す。
         step = self._steps[self._step_index]
         self.current_phase = step.phase
         self.current_object = step.object_name
@@ -446,11 +478,13 @@ class BakeJob:
         return self.status
 
     def run_to_completion(self) -> JobStatus:
+        # backgroundテスト用の同期実行。実処理はadvanceと同一の経路を使う。
         while self.status in {JobStatus.READY, JobStatus.RUNNING}:
             self.advance()
         return self.status
 
     def _restore_context(self) -> None:
+        # export中に変更したScene、選択、active object、Render設定を開始時の値へ戻す。
         snapshot = self._snapshot
         if snapshot is None:
             return
@@ -463,6 +497,7 @@ class BakeJob:
             snapshot.scene.render.image_settings.color_mode = snapshot.image_color_mode
             snapshot.scene.cycles.samples = snapshot.cycles_samples
             snapshot.scene.cycles.use_denoising = snapshot.cycles_use_denoising
+            # 選択状態は元Sceneに属するObjectだけを対象にし、削除済み一時Objectへ触れない。
             for obj in snapshot.scene.objects:
                 obj.select_set(obj in snapshot.selected_objects)
             snapshot.view_layer.objects.active = snapshot.active_object
@@ -492,6 +527,7 @@ class BakeJob:
             pass
 
     def _cleanup(self) -> None:
+        # registryはJobが作ったDataBlockだけを記録するため、元データを削除しない。
         if self.pending_glb is not None:
             self.pending_glb.temporary_path.unlink(missing_ok=True)
             self.pending_glb = None
@@ -499,17 +535,20 @@ class BakeJob:
         self.registry.cleanup()
 
     def _succeed(self) -> None:
+        # 成功後も作業コピーと退避したUI状態は不要なので、通常の終了処理を通す。
         self.completed_units = self.total_units
         self.status = JobStatus.SUCCEEDED
         self.current_phase = "完了"
         self._cleanup()
 
     def _cancel(self) -> None:
+        # キャンセルでも失敗と同じ後始末を行い、出力途中のGLBは確定させない。
         self.status = JobStatus.CANCELLED
         self.current_phase = "キャンセル"
         self._cleanup()
 
     def _fail(self, exc: Exception) -> None:
+        # 例外をUI用診断に変換してから、全一時DataBlockと未確定ファイルを除去する。
         self.status = JobStatus.FAILED
         self.current_phase = "失敗"
         if isinstance(exc, MaterialValidationError):

@@ -14,6 +14,8 @@ bl_info = {
 from . import properties, ui
 
 
+# Blenderの登録順序はPropertyを参照するUIより先でなければならない。
+# 入口では依存モジュールの登録だけを行い、個別の処理状態は保持しない。
 def register() -> None:
     """Propertyを先に登録し、UIから参照できる状態にする。"""
 
@@ -21,6 +23,7 @@ def register() -> None:
     ui.register()
 
 
+# 解除時はUI側が実行中Jobを停止・掃除してから、共有Propertyを外す。
 def unregister() -> None:
     """実行中Jobを停止してからPropertyを解除する。"""
 

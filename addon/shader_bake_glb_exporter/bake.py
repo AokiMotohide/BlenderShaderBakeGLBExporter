@@ -24,11 +24,13 @@ EXTENSION_CHANNELS = {
     "occlusion": ("Occlusion",),
     "volume": ("Thickness",),
 }
+# Channel名はJobの進捗表示とテクスチャ結合の双方で使う。ここでPBR拡張との対応を固定する。
 # 従来のimport互換。実際のJobは材質ごとに必要Channelを選ぶ。
 CHANNELS = CORE_CHANNELS
 
 
 def channels_for_analysis(analysis: MaterialAnalysis) -> tuple[str, ...]:
+    # UNLITはBase/Alphaだけ、FALLBACKは外観近似に必要な最小組、PBRは有効拡張を追加する。
     if analysis.strategy == "UNLIT":
         return ("Base Color", "Alpha")
     channels = list(CORE_CHANNELS)
@@ -48,6 +50,7 @@ class TempDataRegistry:
     """Jobが作成したDataBlockだけを所有し、全終了経路で削除する。"""
 
     def __init__(self) -> None:
+        # 種別ごとに分けておくと、依存するObjectから安全な逆順で削除できる。
         self.scenes: list[bpy.types.Scene] = []
         self.collections: list[bpy.types.Collection] = []
         self.objects: list[bpy.types.Object] = []
@@ -57,6 +60,7 @@ class TempDataRegistry:
         self.node_groups: list[bpy.types.NodeTree] = []
 
     def track(self, block):
+        # Jobが自ら生成したDataBlockだけを記録する。元DataBlockを所有してはいけない。
         if isinstance(block, bpy.types.Scene):
             self.scenes.append(block)
         elif isinstance(block, bpy.types.Collection):
@@ -74,6 +78,7 @@ class TempDataRegistry:
         return block
 
     def _remove(self, blocks: list, collection, block) -> None:
+        # 途中で個別解放済みでもcleanupを失敗させないよう、RNA無効参照を無視する。
         if block in blocks:
             blocks.remove(block)
         try:
@@ -120,6 +125,8 @@ class TempDataRegistry:
 
 @dataclass
 class RawChannel:
+    """ベイク直後のChannel。画像または定数のどちらかで保持し、結合後に解放する。"""
+
     name: str
     resolution: int
     image: bpy.types.Image | None = None
@@ -128,6 +135,8 @@ class RawChannel:
 
 @dataclass
 class MaterialBakeResult:
+    """Material slotごとの中間Channelと、GLB再構築用の最終画像をまとめる。"""
+
     raw: dict[str, RawChannel] = field(default_factory=dict)
     images: dict[str, bpy.types.Image] = field(default_factory=dict)
     emission_strength: float = 1.0
@@ -138,6 +147,8 @@ class MaterialBakeResult:
 
 @dataclass
 class MaterialSlotWork:
+    """元slot、作業コピーでの解析結果、生成済みMaterialを対応付ける。"""
+
     slot_index: int
     source_material: bpy.types.Material
     source_analysis: MaterialAnalysis
@@ -147,6 +158,8 @@ class MaterialSlotWork:
 
 @dataclass
 class WorkObject:
+    """元Objectと、Jobだけが変更してよい作業Objectを1対1で関連付ける。"""
+
     original: bpy.types.Object
     object: bpy.types.Object
     bake_uv_name: str
@@ -159,9 +172,11 @@ def create_job_scene(
 ) -> tuple[bpy.types.Scene, bpy.types.Collection]:
     """元Sceneへ一時Collectionだけを接続し、別SceneのDepsgraphを作らない。"""
 
+    # 元Sceneを使うが、生成物は識別可能な一時Collectionへ閉じ込める。
     token = uuid.uuid4().hex[:8]
     collection = registry.track(bpy.data.collections.new(f"__SHADER_BAKE_GLB_COLLECTION_{token}"))
     scene.collection.children.link(collection)
+    # Bakeに必要な設定だけを一時変更する。Job側のContextSnapshotが必ず復元する。
     scene.render.engine = "CYCLES"
     scene.render.image_settings.file_format = "PNG"
     scene.render.image_settings.color_depth = "8"
@@ -172,10 +187,12 @@ def create_job_scene(
 
 
 def used_material_indices(mesh: bpy.types.Mesh) -> list[int]:
+    # 未使用slotをベイク・検証・UI件数から除外するため、Face参照だけを集める。
     return sorted({polygon.material_index for polygon in mesh.polygons})
 
 
 def _unique_uv_name(mesh: bpy.types.Mesh) -> str:
+    # 元Meshの同名UVを壊さず、作業コピー内でのみ衝突しないBake UV名を決める。
     if mesh.uv_layers.get(BAKE_UV_NAME) is None:
         return BAKE_UV_NAME
     index = 1
@@ -194,6 +211,7 @@ def create_work_object(
 ) -> WorkObject:
     """Modifier適用済みMeshとSlot固有Materialを作り、元DataBlockを共有しない。"""
 
+    # 1. Modifier適用後の評価Meshを新規DataBlockとして取得する。
     depsgraph = context.evaluated_depsgraph_get()
     evaluated = original.evaluated_get(depsgraph)
     mesh = registry.track(
@@ -205,10 +223,12 @@ def create_work_object(
         if not all(math.isfinite(float(component)) for component in vertex.co):
             raise BakeFailure(f"{original.name}: Mesh座標にNaNまたはInfがあります")
 
+    # 2. 作業Objectへ評価時のworld transformを写し、元Objectのtransformには触れない。
     work_object = registry.track(bpy.data.objects.new(original.name, mesh))
     work_object.matrix_world = evaluated.matrix_world.copy()
     collection.objects.link(work_object)
 
+    # 3. Material slotを作業専用コピーへ差し替え、参照元Node Treeの書換えを防ぐ。
     used = used_material_indices(mesh)
     source_slots: list[MaterialSlotWork] = []
     slot_count = max(len(original.material_slots), max(used, default=-1) + 1)
@@ -217,6 +237,7 @@ def create_work_object(
     for slot_index in range(slot_count):
         original_material = original.material_slots[slot_index].material if slot_index < len(original.material_slots) else None
         if original_material is None:
+            # Faceが参照する空slotは、警告付きの既定PBR材質で出力可能にする。
             placeholder = registry.track(bpy.data.materials.new(f"__SHADER_BAKE_GLB_MISSING_SLOT_{slot_index}"))
             placeholder.use_nodes = True
             principled = next(node for node in placeholder.node_tree.nodes if node.bl_idname == "ShaderNodeBsdfPrincipled")
@@ -229,11 +250,13 @@ def create_work_object(
                 analysis = analyze_material(placeholder, original.name)
                 source_slots.append(MaterialSlotWork(slot_index, placeholder, analysis))
             continue
+        # Node Treeを含むMaterialコピーへ切り替えた後だけ、解析・評価用に変更できる。
         copied = registry.track(original_material.copy())
         copied.name = f"{original.name}__slot_{slot_index}__source"
         mesh.materials.append(copied)
         if slot_index in used:
             analysis = analyze_material(copied, original.name)
+            # Node未使用、またはSurface未接続のMaterialはviewport値から最小PBRを再構築する。
             if not copied.use_nodes or copied.node_tree is None:
                 viewport = tuple(float(v) for v in copied.diffuse_color)
                 copied.use_nodes = True
@@ -259,6 +282,7 @@ def create_work_object(
                     warn(original.name, original_material.name, reason)
             source_slots.append(MaterialSlotWork(slot_index, copied, analysis))
 
+    # 4. 元UVは残したまま、Bake用の空UV layerを追加する。展開は次工程で実行する。
     bake_uv_name = _unique_uv_name(mesh)
     source_active_render = next((layer.name for layer in mesh.uv_layers if layer.active_render), None)
     bake_uv = mesh.uv_layers.new(name=bake_uv_name, do_init=False)
@@ -269,6 +293,7 @@ def create_work_object(
 
 
 def unwrap_work_object(context: bpy.types.Context, scene: bpy.types.Scene, work: WorkObject) -> None:
+    # 選択状態を局所化してSmart Projectを実行し、他ObjectのUVや選択を変更しない。
     view_layer = scene.view_layers[0]
     obj = work.object
     for other in scene.objects:
@@ -285,6 +310,7 @@ def unwrap_work_object(context: bpy.types.Context, scene: bpy.types.Scene, work:
         selected_editable_objects=[obj],
     )
     try:
+        # Edit Modeへの移行からObject Modeへの復帰までを同じoverrideで完結させる。
         with context.temp_override(**override):
             bpy.ops.object.mode_set(mode="EDIT")
             bpy.ops.mesh.select_all(action="SELECT")
@@ -299,6 +325,7 @@ def unwrap_work_object(context: bpy.types.Context, scene: bpy.types.Scene, work:
         if "FINISHED" not in result:
             raise BakeFailure(f"{work.original.name}: UV生成に失敗しました")
     finally:
+        # smart_projectの例外時も作業ObjectをEdit Modeのまま残さない。
         if obj.mode != "OBJECT":
             with context.temp_override(**override):
                 bpy.ops.object.mode_set(mode="OBJECT")
@@ -313,6 +340,7 @@ def _new_image(
     colorspace: str,
     alpha: bool = True,
 ) -> bpy.types.Image:
+    # Disk保存はせずJob所有の内部画像として作り、最終GLBへだけ内包させる。
     image = registry.track(
         bpy.data.images.new(name=name, width=resolution, height=resolution, alpha=alpha, float_buffer=float_buffer)
     )
@@ -322,6 +350,7 @@ def _new_image(
 
 
 def _socket_default_rgba(socket: bpy.types.NodeSocket) -> tuple[float, float, float, float]:
+    # Float/Colorの両方を、画像書込みに使うRGBA4要素へ揃える。
     value = socket.default_value
     if isinstance(value, (int, float)):
         scalar = float(value)
@@ -331,6 +360,7 @@ def _socket_default_rgba(socket: bpy.types.NodeSocket) -> tuple[float, float, fl
 
 
 def _connect_or_copy(tree: bpy.types.NodeTree, source: bpy.types.NodeSocket, destination: bpy.types.NodeSocket) -> None:
+    # 出力socket、接続済み入力、定数入力を同じ評価用Emission Nodeへ接続できるようにする。
     if getattr(source, "is_output", False):
         tree.links.new(source, destination)
     elif source.is_linked:
@@ -345,9 +375,11 @@ def _connect_or_copy(tree: bpy.types.NodeTree, source: bpy.types.NodeSocket, des
 
 
 def _raw_constant(slot: MaterialSlotWork, channel: str, resolution: int) -> RawChannel | None:
+    # 未接続の静的入力はbpy.ops.object.bakeを呼ばず、同じ値のChannelとして直接記録する。
     analysis = slot.source_analysis
     principled = analysis.principled_node
     if analysis.strategy == "FALLBACK":
+        # 外観近似ではMetallicだけを既定値で確定し、他Channelは実際の評価結果を焼く。
         if channel == "Metallic":
             return RawChannel(channel, resolution, constant=(0.0, 0.0, 0.0, 1.0))
         return None
@@ -397,11 +429,13 @@ def _raw_constant(slot: MaterialSlotWork, channel: str, resolution: int) -> RawC
 
 
 def _configure_emission_evaluation(material: bpy.types.Material, analysis: MaterialAnalysis, channel: str) -> bpy.types.Node:
+    # 元のSurface接続を一時的にEmissionへ差し替え、指定入力を色としてベイク可能にする。
     tree = material.node_tree
     output = analysis.output_node
     principled = analysis.principled_node
     if output is None or principled is None:
         raise BakeFailure(f"{material.name}: PBR評価入口がありません")
+    # 作業用Materialコピーだけを変更するため、元Materialの見た目・Node Treeは変わらない。
     for link in list(output.inputs["Surface"].links):
         tree.links.remove(link)
     emission = tree.nodes.new("ShaderNodeEmission")
@@ -443,6 +477,7 @@ def _configure_emission_evaluation(material: bpy.types.Material, analysis: Mater
 
 
 def _make_dummy_material(registry: TempDataRegistry, image: bpy.types.Image, name: str) -> bpy.types.Material:
+    # 他slotのactive Imageを安全な1px画像へ退避するためだけの、一時評価用Materialを作る。
     material = registry.track(bpy.data.materials.new(name))
     material.use_nodes = True
     tree = material.node_tree
@@ -459,12 +494,14 @@ def _make_dummy_material(registry: TempDataRegistry, image: bpy.types.Image, nam
 
 
 def _read_pixels(image: bpy.types.Image) -> array:
+    # foreach_getでPythonオブジェクト生成を避け、結合処理用の連続float配列を取得する。
     values = array("f", [0.0]) * (image.size[0] * image.size[1] * 4)
     image.pixels.foreach_get(values)
     return values
 
 
 def _validate_raw(raw: RawChannel) -> None:
+    # ベイク結果を最終8bit画像に落とす前に、寸法・有限値・Channelごとの値域を検査する。
     values: Iterable[float]
     if raw.constant is not None:
         values = raw.constant
@@ -475,6 +512,7 @@ def _validate_raw(raw: RawChannel) -> None:
     else:
         raise BakeFailure(f"{raw.name}: Bake結果がありません")
 
+    # Emissiveだけは強度を別factorへ分離するため、ここではHDR値を保持する。
     allow_hdr = raw.name == "Emissive"
     for value in values:
         scalar = float(value)
@@ -487,6 +525,7 @@ def _validate_raw(raw: RawChannel) -> None:
 
 
 def _channel_default(slot: MaterialSlotWork, channel: str, resolution: int) -> RawChannel:
+    # Bake失敗時でもGLB構造を完成させるため、Channelの意味に沿った安全な既定値を返す。
     viewport = tuple(float(v) for v in slot.source_material.diffuse_color)
     defaults = {
         "Base Color": (viewport[0], viewport[1], viewport[2], 1.0),
@@ -525,6 +564,7 @@ def bake_channel(
 ) -> RawChannel:
     """Object×Material×Channelを1単位として評価する。"""
 
+    # 1. 定数入力ならGPU Bakeを省略し、同じ値を直接中間結果へ入れる。
     constant = _raw_constant(slot, channel, resolution)
     if constant is not None:
         _validate_raw(constant)
@@ -543,6 +583,7 @@ def bake_channel(
     analysis = slot.source_analysis
     view_layer = scene.view_layers[0]
     try:
+        # 2. Raw画像、他slot退避画像、評価用NodeをすべてJob所有として作成する。
         raw_image = _new_image(
             registry,
             f"__SHADER_BAKE_GLB_RAW_{channel}_{token}",
@@ -554,10 +595,12 @@ def bake_channel(
         if evaluation.node_tree is None:
             raise BakeFailure("評価用NodeTreeがありません")
         if analysis.strategy == "PBR":
+            # PBR ChannelはEmission評価に差し替えて、照明やBSDFの影響を除いた入力値を焼く。
             if analysis.output_node is None or analysis.principled_node is None:
                 raise BakeFailure("PBR評価入口がありません")
             original_surface_source = analysis.output_node.inputs["Surface"].links[0].from_socket
             if channel == "Coat Normal":
+                # BlenderのNORMAL Bakeは通常Normal入力を見るため、Coat Normalを一時的に転送する。
                 normal_socket = analysis.principled_node.inputs["Normal"]
                 old_source = normal_socket.links[0].from_socket if normal_socket.is_linked else None
                 old_default = normal_socket.default_value[:]
@@ -571,6 +614,7 @@ def bake_channel(
                 normal_restore = (old_source, old_default)
             elif channel not in {"Normal"}:
                 evaluation_node = _configure_emission_evaluation(evaluation, analysis, channel)
+        # 3. 対象slotだけにRaw画像をactive Imageとして割り当てる。
         for node in evaluation.node_tree.nodes:
             node.select = False
         target_node = evaluation.node_tree.nodes.new("ShaderNodeTexImage")
@@ -581,6 +625,7 @@ def bake_channel(
 
         bake_object = work.object
         mesh = bake_object.data
+        # 同一Meshの他slotが前回のactive Imageへ書き込まないよう、discard画像へ退避する。
         for material_index, other_material in enumerate(mesh.materials):
             if material_index == slot.slot_index or other_material is None or other_material.node_tree is None:
                 continue
@@ -593,6 +638,7 @@ def bake_channel(
             other_material.node_tree.nodes.active = discard_node
             discard_nodes.append((other_material, discard_node))
 
+        # 4. Bake対象を作業Objectだけに絞り、Scene内の元Objectや他の作業Objectを巻き込まない。
         for other in scene.objects:
             other.select_set(False)
         bake_object.select_set(True)
@@ -606,6 +652,7 @@ def bake_channel(
             selected_editable_objects=[bake_object],
         )
         kwargs = dict(target="IMAGE_TEXTURES", save_mode="INTERNAL", use_clear=True, margin=resolution // 64, margin_type="EXTEND", uv_layer=work.bake_uv_name)
+        # 5. 近似/UNLITはBlender標準Bake種別、PBRは入力値をEmissionとして評価する。
         if analysis.strategy in {"FALLBACK", "UNLIT"}:
             bake_type = {
                 "Base Color": "EMIT" if analysis.strategy == "UNLIT" else "DIFFUSE",
@@ -630,12 +677,14 @@ def bake_channel(
         slot.result.raw[channel] = raw
         return raw
     except Exception as exc:
+        # 個別Channelの失敗はJob全体を破棄せず、警告付き既定値でGLBを完成させる。
         fallback = _channel_default(slot, channel, resolution)
         slot.result.raw[channel] = fallback
         if warn:
             warn(work.original.name, slot.source_material.name, f"{channel}のBakeに失敗したため既定値へ置換しました: {exc}")
         return fallback
     finally:
+        # 6. 一時的に変更した作業Materialのlink、active Image Nodeを必ず元へ戻す。
         if analysis.strategy == "PBR" and evaluation.node_tree is not None:
             if evaluation_node is not None and analysis.output_node is not None and original_surface_source is not None:
                 for link in list(analysis.output_node.inputs["Surface"].links):
@@ -661,10 +710,12 @@ def bake_channel(
 
 
 def _raw_values(raw: RawChannel) -> tuple[array | None, tuple[float, float, float, float] | None]:
+    # 以降の結合ループは画像と定数を同じsample関数で扱える形にそろえる。
     return (_read_pixels(raw.image), None) if raw.image is not None else (None, raw.constant)
 
 
 def _sample(values: array | None, constant: tuple[float, float, float, float] | None, pixel: int, component: int) -> float:
+    # 画像ならRGBA配列、定数なら4要素tupleから同じ座標の値を読む。
     if values is not None:
         return float(values[pixel * 4 + component])
     assert constant is not None
@@ -678,6 +729,7 @@ def _write_final_image(
     colorspace: str,
     pixels: array,
 ) -> bpy.types.Image:
+    # 最終画像はGLBの8bit PNG要件に合わせ、float_bufferではなく通常画像として確定する。
     image = _new_image(registry, name, resolution, float_buffer=False, colorspace=colorspace)
     image.pixels.foreach_set(pixels)
     image.update()
@@ -688,6 +740,7 @@ def _write_final_image(
 
 
 def _release_raw(registry: TempDataRegistry, result: MaterialBakeResult, *names: str) -> None:
+    # raw辞書からの解放はメモリ保持を短縮する。DataBlock自体の削除はregistryの依存順cleanupに任せる。
     for name in names:
         raw = result.raw.pop(name, None)
         # 評価MaterialのImage Textureが参照している間は削除しない。
@@ -696,6 +749,7 @@ def _release_raw(registry: TempDataRegistry, result: MaterialBakeResult, *names:
 
 
 def _clamp01(value: float) -> float:
+    # GLBの非HDR Texture Channelへ書く前の共通クランプ。
     return min(1.0, max(0.0, float(value)))
 
 
@@ -707,6 +761,7 @@ def _combine_scalar_image(
     image_name: str,
     stem: str,
 ) -> None:
+    # 1成分ChannelをRGB同値のPNGへ変換し、拡張Material入力へ接続可能にする。
     result = slot.result
     if image_name in result.images or raw_name not in result.raw:
         return
@@ -724,6 +779,7 @@ def _combine_scalar_image(
 def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: TempDataRegistry, stem: str) -> None:
     """必要なChannelが揃った時点で最終8bit画像へまとめ、float画像を解放する。"""
 
+    # 1. Core画像を優先して結合し、完成済み画像は再生成しない。
     result = slot.result
     count = resolution * resolution
     fallback = slot.source_analysis.strategy == "FALLBACK"
@@ -735,12 +791,14 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
         # factor=0ではtexture値が外観へ寄与しないため、白へ正規化する。
         return 1.0 if factor <= 1.0e-6 else _clamp01(value / factor)
 
+    # Base/AlphaはFallbackでの透過推定にも使うため、Transmissionも揃うまで待つ。
     base_ready = {"Base Color", "Alpha"}.issubset(result.raw) and (not fallback or "Transmission" in result.raw)
     if "base_alpha" not in result.images and base_ready:
         base_values, base_constant = _raw_values(result.raw["Base Color"])
         alpha_values, alpha_constant = _raw_values(result.raw["Alpha"])
         transmission_values, transmission_constant = _raw_values(result.raw["Transmission"]) if fallback else (None, None)
         normal_values, normal_constant = _raw_values(result.raw["Normal"]) if "Normal" in result.raw else (None, (0.5, 0.5, 1.0, 1.0))
+        # 正規化不能な背景画素を除外し、実際の形状部分のAlphaからmodeを推定する。
         valid_alpha: list[float] = []
         pixels = array("f", [0.0]) * (count * 4)
         for pixel in range(count):
@@ -759,6 +817,7 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
         result.images["base_alpha"] = _write_final_image(registry, f"{stem}_BaseColorAlpha", resolution, "sRGB", pixels)
         _release_raw(registry, result, "Base Color", "Alpha")
         if fallback:
+            # 近似材質はBakeしたAlpha分布からGLBのalphaModeを選択する。
             if valid_alpha and all(value >= 1.0 - 1.0e-4 for value in valid_alpha):
                 result.alpha_mode = "OPAQUE"
             elif valid_alpha and all(value <= 1.0e-4 or value >= 1.0 - 1.0e-4 for value in valid_alpha):
@@ -770,6 +829,7 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
             result.alpha_mode = slot.source_analysis.alpha.mode
             result.alpha_cutoff = slot.source_analysis.alpha.cutoff
 
+    # Occlusion / Roughness / MetallicはglTF標準のR/G/Bパッキングで1枚へまとめる。
     orm_required = {"Metallic", "Roughness"}
     if "occlusion" in slot.source_analysis.active_extensions:
         orm_required.add("Occlusion")
@@ -787,6 +847,7 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
         result.images["orm"] = _write_final_image(registry, f"{stem}_ORM", resolution, "Non-Color", pixels)
         _release_raw(registry, result, "Metallic", "Roughness", "Occlusion")
 
+    # Normalは色変換せずNon-ColorのRGB値をそのまま最終画像へ移す。
     if "normal" not in result.images and "Normal" in result.raw:
         values, constant = _raw_values(result.raw["Normal"])
         pixels = array("f", [0.0]) * (count * 4)
@@ -799,6 +860,7 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
         result.images["normal"] = _write_final_image(registry, f"{stem}_Normal", resolution, "Non-Color", pixels)
         _release_raw(registry, result, "Normal")
 
+    # HDR Emissiveは画像を0..1へ正規化し、強度をMaterial factorとして保持する。
     if "emissive" not in result.images and "Emissive" in result.raw:
         values, constant = _raw_values(result.raw["Emissive"])
         direct_emission = slot.source_analysis.strategy == "PBR" and (
@@ -830,6 +892,7 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
         result.images["emissive"] = _write_final_image(registry, f"{stem}_Emissive", resolution, "sRGB", pixels)
         _release_raw(registry, result, "Emissive")
 
+    # Transmissionは単一強度として保存し、非ゼロかどうかを拡張出力の判断にも使う。
     if "transmission" not in result.images and "Transmission" in result.raw:
         values, constant = _raw_values(result.raw["Transmission"])
         pixels = array("f", [0.0]) * (count * 4)
@@ -845,6 +908,7 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
         result.detected_transmission = maximum > 1.0e-5
         _release_raw(registry, result, "Transmission")
 
+    # 残る1成分拡張Channelは同じスカラー変換で処理する。
     for raw_name, image_name in (
         ("Specular", "specular"),
         ("Coat", "coat"),
@@ -856,6 +920,7 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
     ):
         _combine_scalar_image(slot, registry, resolution, raw_name, image_name, stem)
 
+    # 色/法線系の拡張Channelは各Channelに必要な色空間を指定して画像化する。
     for raw_name, image_name, colorspace in (
         ("Specular Tint", "specular_tint", "sRGB"),
         ("Coat Normal", "coat_normal", "Non-Color"),
@@ -872,6 +937,7 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
         result.images[image_name] = _write_final_image(registry, f"{stem}_{image_name}", resolution, colorspace, pixels)
         _release_raw(registry, result, raw_name)
 
+    # Sheen tintはweightを色へ乗算して、標準exporterが読む1枚のTextureにする。
     if "sheen_tint" not in result.images and {"Sheen Weight", "Sheen Tint"}.issubset(result.raw):
         weight_values, weight_constant = _raw_values(result.raw["Sheen Weight"])
         tint_values, tint_constant = _raw_values(result.raw["Sheen Tint"])
@@ -887,6 +953,7 @@ def combine_ready_images(slot: MaterialSlotWork, resolution: int, registry: Temp
 
 
 def _image_node(tree: bpy.types.NodeTree, image: bpy.types.Image, name: str) -> bpy.types.Node:
+    # 再構築Materialで使う画像Nodeは命名を固定し、デバッグ時の追跡を容易にする。
     node = tree.nodes.new("ShaderNodeTexImage")
     node.name = name
     node.label = name
@@ -912,6 +979,7 @@ def _gltf_settings_node(tree: bpy.types.NodeTree, registry: TempDataRegistry) ->
 def rebuild_material(slot: MaterialSlotWork, registry: TempDataRegistry, object_name: str) -> bpy.types.Material:
     """ベイク済み画像だけを参照するglTF exporter互換Materialを構築する。"""
 
+    # 1. 変換方式と有効なKHR拡張から、書き出し前に必要な最終画像を確定する。
     images = slot.result.images
     required = {"base_alpha"} if slot.source_analysis.strategy == "UNLIT" else {"base_alpha", "orm", "normal", "emissive"}
     extension_images = {
@@ -931,6 +999,7 @@ def rebuild_material(slot: MaterialSlotWork, registry: TempDataRegistry, object_
     if missing:
         raise BakeFailure(f"{object_name}: 最終画像が不足しています: {', '.join(sorted(missing))}")
 
+    # 2. 元Materialと一切のNodeを共有しない、exporter専用Materialを新規作成する。
     material = registry.track(bpy.data.materials.new(f"{object_name}__slot_{slot.slot_index}__baked"))
     material.use_nodes = True
     material.use_backface_culling = slot.source_material.use_backface_culling
@@ -938,6 +1007,7 @@ def rebuild_material(slot: MaterialSlotWork, registry: TempDataRegistry, object_
     tree.nodes.clear()
     output = tree.nodes.new("ShaderNodeOutputMaterial")
     if slot.source_analysis.strategy == "UNLIT":
+        # UNLITはEmission相当のSurfaceとAlphaだけで構成し、PBR入力を追加しない。
         base = _image_node(tree, images["base_alpha"], "Base Color + Alpha")
         alpha_mode = slot.result.alpha_mode or slot.source_analysis.alpha.mode
         if alpha_mode == "OPAQUE":
@@ -964,6 +1034,7 @@ def rebuild_material(slot: MaterialSlotWork, registry: TempDataRegistry, object_
     principled = tree.nodes.new("ShaderNodeBsdfPrincipled")
     tree.links.new(principled.outputs["BSDF"], output.inputs["Surface"])
 
+    # 3. Base/AlphaとORMを接続し、元の定数factorは必要な場合だけNodeで掛け戻す。
     base = _image_node(tree, images["base_alpha"], "Base Color + Alpha")
     base_factor = slot.source_analysis.base_color_factor if slot.source_analysis.strategy == "PBR" else (1.0, 1.0, 1.0, 1.0)
     base_color_output = base.outputs["Color"]
@@ -987,6 +1058,7 @@ def rebuild_material(slot: MaterialSlotWork, registry: TempDataRegistry, object_
         multiply_alpha.inputs[1].default_value = base_factor[3]
         tree.links.new(alpha_output, multiply_alpha.inputs[0])
         alpha_output = multiply_alpha.outputs[0]
+    # Alphaの閾値はGLBのMASK、連続値はBLENDとしてBlender側の表示設定にも反映する。
     if alpha_mode == "CLIP" or alpha_mode == "MASK":
         clip = tree.nodes.new("ShaderNodeMath")
         clip.operation = "GREATER_THAN"
@@ -1022,12 +1094,14 @@ def rebuild_material(slot: MaterialSlotWork, registry: TempDataRegistry, object_
     tree.links.new(roughness_output, principled.inputs["Roughness"])
     tree.links.new(metallic_output, principled.inputs["Metallic"])
 
+    # OcclusionとVolumeの補助入力は、標準exporterが認識するglTF Material Output Groupを経由する。
     settings = None
     if "occlusion" in extensions or "volume" in extensions:
         settings = _gltf_settings_node(tree, registry)
     if "occlusion" in extensions and settings is not None:
         tree.links.new(separate.outputs["Red"], settings.inputs["Occlusion"])
 
+    # 4. Normal、Emissive、各KHR拡張を、すべてBake UVの画像だけから再接続する。
     normal = _image_node(tree, images["normal"], "Normal")
     normal_map = tree.nodes.new("ShaderNodeNormalMap")
     normal_map.space = "TANGENT"
@@ -1051,6 +1125,7 @@ def rebuild_material(slot: MaterialSlotWork, registry: TempDataRegistry, object_
     tree.links.new(emissive_output, principled.inputs["Emission Color"])
     principled.inputs["Emission Strength"].default_value = slot.result.emission_strength
 
+    # KHR拡張は解析で有効と判定されたものだけをMaterialへ追加する。
     if "transmission" in extensions:
         transmission = _image_node(tree, images["transmission"], "Transmission")
         tree.links.new(transmission.outputs["Color"], principled.inputs["Transmission Weight"])
@@ -1092,6 +1167,7 @@ def rebuild_material(slot: MaterialSlotWork, registry: TempDataRegistry, object_
         tree.links.new(tangent.outputs["Tangent"], principled.inputs["Tangent"])
 
     if "volume" in extensions and settings is not None:
+        # Volumeの動的Node網は再現せず、未接続の色・密度だけを安全に転記する。
         thickness = _image_node(tree, images["thickness"], "Thickness")
         tree.links.new(thickness.outputs["Color"], settings.inputs["Thickness"])
         source_volume = slot.source_analysis.volume_node
@@ -1114,12 +1190,14 @@ def finalize_work_object(work: WorkObject) -> None:
     bake_uv = mesh.uv_layers.get(work.bake_uv_name)
     if bake_uv is None:
         raise BakeFailure(f"{work.original.name}: Bake UVが見つかりません")
+    # 最終GLBではBake UVだけをTEXCOORD_0にし、元UVが余分なTEXCOORDとして出ないようにする。
     for layer in list(mesh.uv_layers):
         if layer != bake_uv:
             mesh.uv_layers.remove(layer)
     bake_uv.name = BAKE_UV_NAME
     bake_uv.active = True
     bake_uv.active_render = True
+    # 使用slotだけを生成済みMaterialへ置換する。未使用slotはexporterが参照しない。
     for slot in work.slots:
         if slot.final_material is None:
             raise BakeFailure(f"{work.original.name}: Material再構築が完了していません")

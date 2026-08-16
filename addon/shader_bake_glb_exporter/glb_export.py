@@ -21,12 +21,16 @@ BIN_CHUNK = 0x004E4942
 
 @dataclass(frozen=True)
 class ParsedGlb:
+    """検証済みGLBのJSONチャンクとBINチャンクを分離した読み取り結果。"""
+
     document: dict
     binary: bytes
 
 
 @dataclass(frozen=True)
 class PendingGlb:
+    """最終置換前の一時GLBと、検証時に期待する出力数の組。"""
+
     temporary_path: Path
     final_path: Path
     expected_meshes: int
@@ -34,6 +38,7 @@ class PendingGlb:
 
 
 def _finite_json(value, path: str = "$") -> None:
+    # JSON parserが受け入れても、GLBへNaN/Infを持ち込むことは許可しない。
     if isinstance(value, float) and not math.isfinite(value):
         raise BakeFailure(f"GLB JSONにNaNまたはInfがあります: {path}")
     if isinstance(value, dict):
@@ -45,6 +50,7 @@ def _finite_json(value, path: str = "$") -> None:
 
 
 def parse_glb(path: Path) -> ParsedGlb:
+    # GLBの固定ヘッダー、全chunk境界、JSON/BINの存在を順に検査する。
     data = path.read_bytes()
     if len(data) < 20:
         raise BakeFailure("GLBが短すぎます")
@@ -54,6 +60,7 @@ def parse_glb(path: Path) -> ParsedGlb:
     offset = 12
     document = None
     binary = b""
+    # chunk順は固定しないが、宣言された境界の外へ読むデータは拒否する。
     while offset + 8 <= len(data):
         chunk_length, chunk_type = struct.unpack_from("<II", data, offset)
         offset += 8
@@ -73,6 +80,7 @@ def parse_glb(path: Path) -> ParsedGlb:
 
 
 def _validate_png_images(parsed: ParsedGlb) -> None:
+    # 出力仕様は内包8bit PNGのみ。外部URIや別形式は許可しない。
     document = parsed.document
     buffer_views = document.get("bufferViews", [])
     images = document.get("images", [])
@@ -87,6 +95,7 @@ def _validate_png_images(parsed: ParsedGlb) -> None:
         view = buffer_views[view_index]
         start = int(view.get("byteOffset", 0))
         end = start + int(view.get("byteLength", 0))
+        # bufferViewの範囲だけを切り出し、PNGシグネチャとIHDRの寸法を確認する。
         payload = parsed.binary[start:end]
         if len(payload) < 33 or payload[:8] != b"\x89PNG\r\n\x1a\n":
             raise BakeFailure(f"画像{index}のPNGヘッダーが不正です")
@@ -134,6 +143,7 @@ def _validate_node_hierarchy(document: dict) -> None:
     visiting: set[int] = set()
 
     def visit(node_index: int) -> None:
+        # 深さ優先走査中の集合を分け、共有参照と循環参照を区別する。
         if node_index in visiting:
             raise BakeFailure("Node階層が循環しています")
         if node_index in visited:
@@ -160,6 +170,7 @@ def _validate_node_hierarchy(document: dict) -> None:
 
 
 def _material_texture_infos(material: dict):
+    # Core PBRと各拡張のTextureInfoを同じUV契約で検査できる形へ並べる。
     pbr = material.get("pbrMetallicRoughness", {})
     for name in ("baseColorTexture", "metallicRoughnessTexture"):
         info = pbr.get(name)
@@ -178,6 +189,7 @@ def _material_texture_infos(material: dict):
 
 
 def _texture_transform_signature(info: dict, material_index: int, slot_name: str) -> tuple:
+    # すべての画像がBake UV (TEXCOORD_0) と同一transformを使うことを比較するための値。
     tex_coord = info.get("texCoord", 0)
     if not isinstance(tex_coord, int) or tex_coord < 0:
         raise BakeFailure(f"Material {material_index}の{slot_name}.texCoordが不正です")
@@ -186,6 +198,7 @@ def _texture_transform_signature(info: dict, material_index: int, slot_name: str
         raise BakeFailure(f"Material {material_index}の{slot_name}.KHR_texture_transformが不正です")
 
     def vector(name: str, default: tuple[float, float]) -> tuple[float, float]:
+        # offset/scaleは必ず有限の2要素vectorへ正規化する。
         value = transform.get(name, list(default))
         if not isinstance(value, list) or len(value) != 2:
             raise BakeFailure(f"Material {material_index}の{slot_name}.{name}が不正です")
@@ -206,6 +219,7 @@ def _texture_transform_signature(info: dict, material_index: int, slot_name: str
 
 
 def _validate_factor(value, length: int, minimum: float, maximum: float, label: str) -> None:
+    # JSON上の数値形式を許容しつつ、GLB係数の要素数と値域を一か所で保証する。
     values = value if isinstance(value, list) else [value]
     if len(values) != length:
         raise BakeFailure(f"{label}の要素数が不正です")
@@ -218,6 +232,7 @@ def _validate_factor(value, length: int, minimum: float, maximum: float, label: 
 def validate_glb(path: Path, expected_meshes: int, expected_materials: int) -> ParsedGlb:
     """独自writerを持たず、標準exporterの成果物だけを構造検証する。"""
 
+    # 1. コンテナとトップレベル構成を検証する。
     parsed = parse_glb(path)
     document = parsed.document
     asset = document.get("asset", {})
@@ -241,8 +256,10 @@ def validate_glb(path: Path, expected_meshes: int, expected_materials: int) -> P
     if "KHR_draco_mesh_compression" in document.get("extensionsUsed", []):
         raise BakeFailure("GLBにDraco圧縮が含まれています")
 
+    # 2. export時に複製した階層が、GLBの単一親・非循環契約を満たすか確認する。
     _validate_node_hierarchy(document)
 
+    # 3. Mesh属性を検証する。Bake UV以外、Morph、圧縮は出力契約に含めない。
     for mesh_index, mesh in enumerate(document.get("meshes", [])):
         primitives = mesh.get("primitives", [])
         if not primitives:
@@ -265,6 +282,7 @@ def validate_glb(path: Path, expected_meshes: int, expected_materials: int) -> P
             if not isinstance(material_index, int) or not 0 <= material_index < material_count:
                 raise BakeFailure(f"Mesh {mesh_index}/{primitive_index}のMaterial参照が不正です")
 
+    # 4. PBR/拡張Materialが、ベイク済み画像と一貫したUVを参照することを検証する。
     for material_index, material in enumerate(document.get("materials", [])):
         pbr = material.get("pbrMetallicRoughness", {})
         extensions = material.get("extensions", {})
@@ -316,6 +334,7 @@ def validate_glb(path: Path, expected_meshes: int, expected_materials: int) -> P
             if not any(name in extension for name in texture_names):
                 raise BakeFailure(f"Material {material_index}の{extension_name} textureが不足しています")
 
+    # 5. Materialから参照される画像コンテナも最後に検証する。
     _validate_png_images(parsed)
     return parsed
 
@@ -329,12 +348,14 @@ def export_to_temporary_glb(
 ) -> PendingGlb:
     """最終パスを変更せず、同一ディレクトリの一時GLBへ書き出す。"""
 
+    # 最終パスと同じディレクトリに一時ファイルを置き、os.replaceの原子性を確保する。
     final_path = final_path.expanduser().resolve()
     final_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = final_path.with_name(f".{final_path.stem}.{uuid.uuid4().hex}.tmp.glb")
     view_layer = scene.view_layers[0]
     selected = list(dict.fromkeys(hierarchy_objects))
     active = work_objects[0].object
+    # 標準exporterには完成コピーと階層proxyだけを選択状態として渡す。
     for obj in scene.objects:
         obj.select_set(obj in selected)
     view_layer.objects.active = active
@@ -347,6 +368,7 @@ def export_to_temporary_glb(
         selected_editable_objects=selected,
     )
     try:
+        # exporterの副作用を局所化するため、Scene/ViewLayer/選択をすべてoverrideする。
         with context.temp_override(**override):
             result = bpy.ops.export_scene.gltf(
                 filepath=str(temporary),
@@ -379,6 +401,7 @@ def export_to_temporary_glb(
             sum(len(work.slots) for work in work_objects),
         )
     except Exception:
+        # 失敗時に一時ファイルを残さず、既存の最終GLBには一切触れない。
         temporary.unlink(missing_ok=True)
         raise
 
@@ -387,6 +410,7 @@ def validate_and_commit(pending: PendingGlb) -> ParsedGlb:
     """全検証成功後だけ既存GLBを原子的に置換する。"""
 
     try:
+        # 検証と置換を分離し、壊れた成果物が既存ファイルを上書きしないようにする。
         parsed = validate_glb(pending.temporary_path, pending.expected_meshes, pending.expected_materials)
         os.replace(pending.temporary_path, pending.final_path)
         return parsed

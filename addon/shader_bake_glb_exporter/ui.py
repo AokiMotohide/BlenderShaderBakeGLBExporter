@@ -14,11 +14,13 @@ from .job import BakeJob, BakeJobConfig, JobStatus, detected_material_count, sel
 ACTIVE_JOB: BakeJob | None = None
 
 
+# UI操作中のWindowManager設定へ集約してアクセスする。
 def _settings(context: bpy.types.Context):
     return context.window_manager.shader_bake_glb
 
 
 def _copy_job_state(context: bpy.types.Context, job: BakeJob) -> None:
+    # JobはBlender Propertyを直接書き換えない。ここで表示専用状態へ一括転記する。
     settings = _settings(context)
     settings.is_running = job.status == JobStatus.RUNNING
     settings.cancel_requested = job.cancel_requested
@@ -78,15 +80,18 @@ class SHADERBAKEGLB_OT_ExportSelected(bpy.types.Operator, ExportHelper):
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
+        # 同時に複数のJobを開始すると選択状態と一時DataBlockの所有権が競合する。
         return context.window_manager is not None and not _settings(context).is_running
 
     def check(self, _context: bpy.types.Context) -> bool:
+        # ファイルブラウザでの入力中にも拡張子を正規化し、実行時との結果を揃える。
         normalized = ensure_glb_extension(self.filepath)
         changed = normalized != self.filepath
         self.filepath = normalized
         return changed
 
     def invoke(self, context: bpy.types.Context, event: bpy.types.Event):
+        # 保存候補は前回値を優先し、未指定時はBlend名、最後に選択Mesh名から決める。
         settings = _settings(context)
         active = context.view_layer.objects.active
         active_name = active.name if active is not None and active.type == "MESH" else ""
@@ -101,6 +106,7 @@ class SHADERBAKEGLB_OT_ExportSelected(bpy.types.Operator, ExportHelper):
 
     def execute(self, context: bpy.types.Context):
         global ACTIVE_JOB
+        # 前回の診断を消去してから、新しい1回分のJobを作成する。
         settings = _settings(context)
         settings.errors.clear()
         settings.warnings.clear()
@@ -114,6 +120,7 @@ class SHADERBAKEGLB_OT_ExportSelected(bpy.types.Operator, ExportHelper):
         config = BakeJobConfig(Path(output_text), int(settings.resolution))
         job = BakeJob(context, config)
         ACTIVE_JOB = job
+        # startは検証と作業コピー作成だけを行う。重い各工程はModal timerで分割実行する。
         job.start()
         _copy_job_state(context, job)
         if job.status == JobStatus.FAILED:
@@ -130,12 +137,14 @@ class SHADERBAKEGLB_OT_ExportSelected(bpy.types.Operator, ExportHelper):
         if job is None:
             self._finish_timer(context)
             return {"CANCELLED"}
+        # ESCは即時にBlender Operatorを中断せず、現在の1工程の完了後に安全に停止する。
         if event.type == "ESC":
             job.request_cancel()
             _settings(context).cancel_requested = True
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
 
+        # timer 1回につきJobの1工程だけを進め、UIとキャンセル操作の応答性を保つ。
         status = job.advance()
         _copy_job_state(context, job)
         for area in context.screen.areas if context.screen else ():
@@ -160,11 +169,13 @@ class SHADERBAKEGLB_OT_ExportSelected(bpy.types.Operator, ExportHelper):
         return {"CANCELLED"}
 
     def _finish_timer(self, context: bpy.types.Context) -> None:
+        # 完了・失敗・キャンセルの各経路でtimerを1回だけ解放する。
         if self._timer is not None:
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
 
     def cancel(self, context: bpy.types.Context) -> None:
+        # BlenderがModal Operatorを強制取消した場合も、Jobに後始末を実行させる。
         global ACTIVE_JOB
         if ACTIVE_JOB is not None:
             ACTIVE_JOB.request_cancel()
@@ -185,6 +196,7 @@ class SHADERBAKEGLB_OT_Cancel(bpy.types.Operator):
         return ACTIVE_JOB is not None and ACTIVE_JOB.status == JobStatus.RUNNING
 
     def execute(self, context: bpy.types.Context):
+        # 押下時点では要求だけを記録する。実際の破棄は次のadvanceで行う。
         if ACTIVE_JOB is not None:
             ACTIVE_JOB.request_cancel()
             settings = _settings(context)
@@ -209,6 +221,7 @@ class SHADERBAKEGLB_PT_Panel(bpy.types.Panel):
         stats.label(text=f"選択Mesh数: {len(meshes)}")
         stats.label(text=f"検出Material数: {detected_material_count(meshes)}")
 
+        # 実行中は進捗と診断だけを表示し、同じ状態を変更する操作を出さない。
         if settings.is_running:
             text = f"{settings.completed_units} / {settings.total_units}"
             layout.progress(factor=settings.progress, type="BAR", text=text)
@@ -242,6 +255,7 @@ class SHADERBAKEGLB_PT_Panel(bpy.types.Panel):
 CLASSES = (SHADERBAKEGLB_OT_ExportSelected, SHADERBAKEGLB_OT_Cancel, SHADERBAKEGLB_PT_Panel)
 
 
+# OperatorとPanelをまとめて登録し、Sidebarから公開する。
 def register() -> None:
     for cls in CLASSES:
         bpy.utils.register_class(cls)
@@ -249,6 +263,7 @@ def register() -> None:
 
 def unregister() -> None:
     global ACTIVE_JOB
+    # アドオン解除中でも一時DataBlockを残さないよう、実行中Jobを終了させる。
     if ACTIVE_JOB is not None and ACTIVE_JOB.status == JobStatus.RUNNING:
         ACTIVE_JOB.request_cancel()
         ACTIVE_JOB.advance()
